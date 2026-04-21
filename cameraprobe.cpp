@@ -2,11 +2,14 @@
 
 #include <QDebug>
 
+// FrameGrabSurface 构造：仅做基类初始化。
 FrameGrabSurface::FrameGrabSurface(QObject *parent)
     : QAbstractVideoSurface(parent)
 {
 }
 
+// 声明支持的像素格式集合。
+// 这里返回 Qt 已知的全部像素格式，交由运行时设备协商最终格式。
 QList<QVideoFrame::PixelFormat> FrameGrabSurface::supportedPixelFormats(
         QAbstractVideoBuffer::HandleType type) const
 {
@@ -20,17 +23,21 @@ QList<QVideoFrame::PixelFormat> FrameGrabSurface::supportedPixelFormats(
     return formats;
 }
 
+// 设置当前抓帧任务关联的相机元信息（描述、设备名）。
 void FrameGrabSurface::setExpectedMeta(const QString &desc, const QString &devName)
 {
     m_cameraDescription = desc;
     m_deviceName = devName;
 }
 
+// 启用 one-shot：下一帧有效数据到达时抓取后即关闭等待状态。
 void FrameGrabSurface::armOneShot()
 {
     m_waitingFirstFrame = true;
 }
 
+// Surface 收帧回调。
+// 设计目标：只抓取第一帧可用数据，避免持续占用与重复回调。
 bool FrameGrabSurface::present(const QVideoFrame &frame)
 {
     if (!m_waitingFirstFrame) {
@@ -79,6 +86,8 @@ bool FrameGrabSurface::present(const QVideoFrame &frame)
     const int loopPlaneCount = planeCount > 0 ? planeCount : 1;
     const int mappedBytesTotal = copy.mappedBytes();
     for (int p = 0; p < loopPlaneCount; ++p) {
+        // Qt 5.12 下 mappedBytes() 只有总大小接口，
+        // 因此仅记录 plane0 的总映射大小，其它 plane 记为 -1。
         const int bytesPerLine = copy.bytesPerLine(p);
 
         out.bytesPerLines.push_back(bytesPerLine);
@@ -103,6 +112,7 @@ bool FrameGrabSurface::present(const QVideoFrame &frame)
     return true;
 }
 
+// CameraProbe 构造：注册元类型并初始化首帧超时计时器。
 CameraProbe::CameraProbe(QObject *parent)
     : QObject(parent)
 {
@@ -114,11 +124,13 @@ CameraProbe::CameraProbe(QObject *parent)
             this, &CameraProbe::onCaptureTimeout);
 }
 
+// 析构时确保相机与 surface 被正确释放。
 CameraProbe::~CameraProbe()
 {
     stopCapture();
 }
 
+// 像素格式枚举转字符串，用于日志与 UI 可读展示。
 QString CameraProbe::pixelFormatToString(QVideoFrame::PixelFormat fmt)
 {
     switch (fmt) {
@@ -141,6 +153,11 @@ QString CameraProbe::pixelFormatToString(QVideoFrame::PixelFormat fmt)
     }
 }
 
+// 枚举所有可见摄像头及其模式。
+// 兼容策略：
+// 1) 优先使用 supportedViewfinderSettings；
+// 2) 若为空，回退 resolution x pixelFormat 组合；
+// 3) 再不行也保留设备占位，便于 UI 告警“有设备但无模式”。
 QList<CameraModeInfo> CameraProbe::enumerateAllModes()
 {
     QList<CameraModeInfo> result;
@@ -209,6 +226,7 @@ QList<CameraModeInfo> CameraProbe::enumerateAllModes()
     return result;
 }
 
+// 从全部模式中过滤 YUY2/YUYV。
 QList<CameraModeInfo> CameraProbe::enumerateYuy2Modes()
 {
     QList<CameraModeInfo> all = enumerateAllModes();
@@ -223,6 +241,10 @@ QList<CameraModeInfo> CameraProbe::enumerateYuy2Modes()
     return yuy2;
 }
 
+// 按优先级选择“最合适”的 YUY2 模式：
+// 1) 指定宽高精确匹配；
+// 2) 640x480 回退；
+// 3) 第一条可用 YUY2 模式。
 bool CameraProbe::findPreferredYuy2Mode(int width,
                                         int height,
                                         CameraModeInfo &outMode,
@@ -282,6 +304,11 @@ bool CameraProbe::findPreferredYuy2Mode(int width,
     return true;
 }
 
+// 启动单帧抓取流程：
+// - 重建 QCamera/Surface；
+// - 挂接信号槽；
+// - 设置请求模式（可为空表示走默认）；
+// - 启动相机并开启首帧超时计时。
 bool CameraProbe::startSingleFrameCapture(const CameraModeInfo &mode)
 {
     stopCapture();
@@ -315,6 +342,7 @@ bool CameraProbe::startSingleFrameCapture(const CameraModeInfo &mode)
             || mode.settings.maximumFrameRate() > 0.0;
 
     if (hasResolution || hasPixelFormat || hasFrameRate) {
+        // 仅在请求参数有效时设置，避免向驱动写入无意义配置。
         m_camera->setViewfinderSettings(mode.settings);
         emit logMessage(QStringLiteral("Requested mode: resolution=%1x%2, format=%3, fps=[%4,%5]")
                         .arg(mode.settings.resolution().width())
@@ -342,6 +370,8 @@ bool CameraProbe::startSingleFrameCapture(const CameraModeInfo &mode)
     return true;
 }
 
+// 停止抓取并释放对象。
+// 注意：使用 deleteLater 与 Qt 事件循环配合，避免潜在重入风险。
 void CameraProbe::stopCapture()
 {
     if (m_frameTimeout) {
@@ -360,6 +390,7 @@ void CameraProbe::stopCapture()
     }
 }
 
+// 相机错误回调：上抛错误并异步停止抓取。
 void CameraProbe::onCameraError(QCamera::Error error)
 {
     Q_UNUSED(error);
@@ -368,23 +399,27 @@ void CameraProbe::onCameraError(QCamera::Error error)
     QTimer::singleShot(0, this, &CameraProbe::stopCapture);
 }
 
+// 透传 Surface 日志。
 void CameraProbe::onSurfaceLog(const QString &msg)
 {
     emit logMessage(msg);
 }
 
+// 首帧抓取成功回调：向上层发结果并异步收尾。
 void CameraProbe::onSurfaceFrameCaptured(const CapturedFrame &frame)
 {
     emit captureSucceeded(frame);
     QTimer::singleShot(0, this, &CameraProbe::stopCapture);
 }
 
+// 首帧抓取失败回调：向上层发错误并异步收尾。
 void CameraProbe::onSurfaceFrameFailed(const QString &reason)
 {
     emit captureFailed(reason);
     QTimer::singleShot(0, this, &CameraProbe::stopCapture);
 }
 
+// 首帧超时保护：避免设备异常时界面长期等待。
 void CameraProbe::onCaptureTimeout()
 {
     emit captureFailed(QStringLiteral("Timeout waiting first frame (%1 ms). Try default format or close other apps using the camera.")

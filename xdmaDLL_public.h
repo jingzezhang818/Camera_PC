@@ -3,9 +3,12 @@
 * @Author: __
 * @Version: 1.0
 * @Date: 2020年10月25日09:55:26
-* @Description: This is a file about exporting function declarations
-
-* @ 硬件设计：XDMA-IP核
+* @Description: XDMA 封装 DLL 对外导出接口声明
+*
+* 说明：
+* 1) 该头文件只声明接口，不包含具体实现；
+* 2) 上层应用通过这些接口完成设备枚举、通道打开、读写与状态控制；
+* 3) 底层硬件为 XDMA IP。
 ********************************************************************************/
 
 #ifdef K7CTRBOARDDRIVER_EXPORTS
@@ -32,6 +35,10 @@
 DEFINE_GUID(GUID_DEVINTERFACE_XDMA,
 	0x74c7e4a9, 0x6d5d, 0x4a70, 0xbc, 0x0d, 0x20, 0x69, 0x1d, 0xff, 0x9e, 0x9d);
 
+// XDMA 子设备文件名常量：
+// - user: BAR/控制通道
+// - h2c_x: 主机到板卡
+// - c2h_x: 板卡到主机
 #define	XDMA_FILE_USER		"user"
 #define	XDMA_FILE_H2C_0		"h2c_0"
 #define	XDMA_FILE_C2H_0		"c2h_0"
@@ -49,6 +56,11 @@ DEFINE_GUID(GUID_DEVINTERFACE_XDMA,
 #ifdef  __cplusplus
 extern "C" {
 #endif
+	/*
+	 * 以下为 DLL 导出 C 接口：
+	 * - 使用 extern "C" 便于 C/C++ 统一调用；
+	 * - 返回值约定由各函数注释说明。
+	 */
 	/*-
 	Function name : allocate_buffer
 	Description   : 为缓冲区申请空间

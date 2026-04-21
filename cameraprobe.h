@@ -1,6 +1,11 @@
 ﻿#ifndef CAMERAPROBE_H
 #define CAMERAPROBE_H
 
+// CameraProbe 模块职责：
+// - 枚举摄像头及可用模式；
+// - 按指定模式启动一次性单帧抓取；
+// - 将首帧封装为 CapturedFrame 结构并回调给上层。
+
 #include <QObject>
 #include <QCamera>
 #include <QCameraInfo>
@@ -13,6 +18,7 @@
 #include <QString>
 #include <QTimer>
 
+// 单个相机模式描述：包括相机身份信息与对应 viewfinder 参数。
 struct CameraModeInfo
 {
     int cameraIndex = -1;
@@ -22,6 +28,10 @@ struct CameraModeInfo
     QCameraViewfinderSettings settings;
 };
 
+// 单帧抓取结果：
+// - 元信息：设备名、分辨率、像素格式、时间戳；
+// - 布局信息：plane 数、每行字节数、每 plane 映射大小；
+// - 负载：原始帧字节数据。
 struct CapturedFrame
 {
     QString cameraDescription;
@@ -37,6 +47,9 @@ struct CapturedFrame
 
 Q_DECLARE_METATYPE(CapturedFrame)
 
+// 用于承接 QCamera 输出帧的 Surface：
+// - 在 one-shot 模式下只抓第一帧；
+// - 抓到后立即回调并关闭等待状态。
 class FrameGrabSurface : public QAbstractVideoSurface
 {
     Q_OBJECT
@@ -49,6 +62,8 @@ public:
     bool present(const QVideoFrame &frame) override;
 
     void setExpectedMeta(const QString &desc, const QString &devName);
+
+    // 打开一次性抓帧开关：下一帧有效帧到达即抓取。
     void armOneShot();
 
 signals:
@@ -57,11 +72,15 @@ signals:
     void frameCaptureFailed(const QString &reason);
 
 private:
+    // 标记当前是否在等待首帧。
     bool m_waitingFirstFrame = false;
+
+    // 由上层传入，用于把帧与具体相机设备绑定。
     QString m_cameraDescription;
     QString m_deviceName;
 };
 
+// 外部使用的抓帧控制器：管理 QCamera 与 FrameGrabSurface 生命周期。
 class CameraProbe : public QObject
 {
     Q_OBJECT
@@ -70,15 +89,26 @@ public:
     ~CameraProbe() override;
 
     static QList<CameraModeInfo> enumerateAllModes();
+
+    // 仅筛选 YUY2/YUYV 模式，供上层优先抓取。
     static QList<CameraModeInfo> enumerateYuy2Modes();
+
+    // 像素格式枚举转可读字符串，便于日志展示。
     static QString pixelFormatToString(QVideoFrame::PixelFormat fmt);
 
+    // 按优先级寻找模式：
+    // 1) 精确匹配宽高 + YUY2；
+    // 2) 回退 640x480 YUY2；
+    // 3) 回退第一条 YUY2。
     static bool findPreferredYuy2Mode(int width,
                                       int height,
                                       CameraModeInfo &outMode,
                                       QString *reason = nullptr);
 
+    // 启动一次单帧抓取。
     bool startSingleFrameCapture(const CameraModeInfo &mode);
+
+    // 停止抓取并释放内部对象。
     void stopCapture();
 
 signals:
@@ -87,16 +117,28 @@ signals:
     void captureFailed(const QString &reason);
 
 private slots:
+    // 相机错误回调。
     void onCameraError(QCamera::Error error);
+
+    // Surface 内部事件回调。
     void onSurfaceLog(const QString &msg);
     void onSurfaceFrameCaptured(const CapturedFrame &frame);
     void onSurfaceFrameFailed(const QString &reason);
+
+    // 首帧超时回调：防止无限等待。
     void onCaptureTimeout();
 
 private:
+    // 抓帧期间的相机对象。
     QCamera *m_camera = nullptr;
+
+    // 承接相机输出帧并做 one-shot 采样的 surface。
     FrameGrabSurface *m_surface = nullptr;
+
+    // 首帧超时计时器。
     QTimer *m_frameTimeout = nullptr;
+
+    // 首帧等待时长（毫秒）。
     int m_frameTimeoutMs = 3000;
 };
 

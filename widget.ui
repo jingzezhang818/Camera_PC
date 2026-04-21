@@ -30,6 +30,34 @@
        </property>
       </widget>
      </item>
+   <item>
+    <widget class="QPushButton" name="btnSendCapturedFrame">
+     <property name="text">
+      <string>发送最近一帧到H2C_0</string>
+     </property>
+    </widget>
+   </item>
+     <item>
+      <widget class="QPushButton" name="btnSendLiveVideo">
+       <property name="text">
+        <string>开始发送实时视频到H2C</string>
+       </property>
+      </widget>
+     </item>
+         <item>
+            <widget class="QPushButton" name="btnOpenXdma">
+             <property name="text">
+                <string>打开XDMA并自检</string>
+             </property>
+            </widget>
+         </item>
+         <item>
+            <widget class="QPushButton" name="btnSendTestPacket">
+             <property name="text">
+                <string>发送测试包到H2C_0</string>
+             </property>
+            </widget>
+         </item>
      <item>
       <spacer name="horizontalSpacer">
        <property name="orientation">
