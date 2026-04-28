@@ -10,6 +10,29 @@
 
 namespace {
 
+QtMessageHandler g_defaultMessageHandler = nullptr;
+
+bool isIgnorableCameraParamWarning(const QString &msg)
+{
+    return msg.startsWith(QStringLiteral("Unable to query the parameter info: QCameraImageProcessingControl::"));
+}
+
+void appMessageHandler(QtMsgType type,
+                       const QMessageLogContext &context,
+                       const QString &msg)
+{
+    if (type == QtWarningMsg && isIgnorableCameraParamWarning(msg)) {
+        return;
+    }
+
+    if (g_defaultMessageHandler) {
+        g_defaultMessageHandler(type, context, msg);
+        return;
+    }
+
+    qt_message_output(type, context, msg);
+}
+
 void setupChineseUiFont(QApplication &app)
 {
     const QStringList candidates = {
@@ -46,6 +69,8 @@ int main(int argc, char *argv[])
 {
     // 跟随系统 locale，避免非 UTF-8 运行环境导致文本行为异常。
     std::setlocale(LC_ALL, "");
+
+    g_defaultMessageHandler = qInstallMessageHandler(appMessageHandler);
 
     QApplication a(argc, argv);
     setupChineseUiFont(a);

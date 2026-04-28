@@ -15,6 +15,7 @@
 #include <QVector>
 #include <vector>
 #include <cstring>
+#include <cmath>
 
 // XDMA 辅助 API，由厂商 DLL 导出。
 #include "xdmaDLL_public_linux.h"
@@ -108,6 +109,180 @@ bool yuyvToRgbImage(const CapturedFrame &frame, QImage &outImage)
     return true;
 }
 
+constexpr int kTargetPreviewWidth = 640;
+constexpr int kTargetPreviewHeight = 360;
+constexpr qreal kTargetPreviewFps = 30.0;
+constexpr qreal kFpsTolerance = 0.6;
+
+bool hasValidResolution(const QCameraViewfinderSettings &settings)
+{
+    const QSize resolution = settings.resolution();
+    return resolution.width() > 0 && resolution.height() > 0;
+}
+
+bool fpsRangeContains(const QCameraViewfinderSettings &settings, qreal targetFps)
+{
+    const qreal minFps = settings.minimumFrameRate();
+    const qreal maxFps = settings.maximumFrameRate();
+    if (minFps <= 0.0 && maxFps <= 0.0) {
+        return true;
+    }
+    if (minFps > 0.0 && maxFps > 0.0) {
+        return targetFps + kFpsTolerance >= minFps
+                && targetFps - kFpsTolerance <= maxFps;
+    }
+
+    const qreal singleFps = qMax(minFps, maxFps);
+    return std::abs(singleFps - targetFps) <= kFpsTolerance;
+}
+
+qreal fpsDistance(const QCameraViewfinderSettings &settings, qreal targetFps)
+{
+    if (fpsRangeContains(settings, targetFps)) {
+        return 0.0;
+    }
+
+    const qreal minFps = settings.minimumFrameRate();
+    const qreal maxFps = settings.maximumFrameRate();
+    if (minFps > 0.0 && targetFps < minFps) {
+        return minFps - targetFps;
+    }
+    if (maxFps > 0.0 && targetFps > maxFps) {
+        return targetFps - maxFps;
+    }
+
+    const qreal singleFps = qMax(minFps, maxFps);
+    if (singleFps > 0.0) {
+        return std::abs(singleFps - targetFps);
+    }
+
+    return 0.0;
+}
+
+int pixelFormatScore(QVideoFrame::PixelFormat fmt)
+{
+    switch (fmt) {
+    case QVideoFrame::Format_YUYV:    return 60;
+    case QVideoFrame::Format_UYVY:    return 55;
+    case QVideoFrame::Format_NV12:    return 50;
+    case QVideoFrame::Format_NV21:    return 48;
+    case QVideoFrame::Format_YUV420P: return 45;
+    case QVideoFrame::Format_YV12:    return 43;
+    case QVideoFrame::Format_RGB24:   return 35;
+    case QVideoFrame::Format_RGB32:   return 33;
+    case QVideoFrame::Format_ARGB32:  return 31;
+    case QVideoFrame::Format_BGR24:   return 29;
+    case QVideoFrame::Format_BGR32:   return 27;
+    case QVideoFrame::Format_Jpeg:    return 12;
+    case QVideoFrame::Format_Invalid: return -1000;
+    default:                          return 20;
+    }
+}
+
+bool chooseFixedPreviewMode(const QCameraInfo &cameraInfo,
+                            CameraModeInfo &outMode,
+                            QString *reason = nullptr)
+{
+    const QList<CameraModeInfo> modes = CameraProbe::enumerateAllModes();
+    bool found = false;
+
+    for (const CameraModeInfo &candidate : modes) {
+        if (candidate.deviceName != cameraInfo.deviceName()) {
+            continue;
+        }
+        if (!hasValidResolution(candidate.settings)) {
+            continue;
+        }
+        if (candidate.settings.pixelFormat() == QVideoFrame::Format_Invalid) {
+            continue;
+        }
+
+        if (!found) {
+            outMode = candidate;
+            found = true;
+            continue;
+        }
+
+        const QCameraViewfinderSettings &a = candidate.settings;
+        const QCameraViewfinderSettings &b = outMode.settings;
+        const QSize ra = a.resolution();
+        const QSize rb = b.resolution();
+
+        const bool aExactRes = ra.width() == kTargetPreviewWidth
+                && ra.height() == kTargetPreviewHeight;
+        const bool bExactRes = rb.width() == kTargetPreviewWidth
+                && rb.height() == kTargetPreviewHeight;
+        if (aExactRes != bExactRes) {
+            if (aExactRes) {
+                outMode = candidate;
+            }
+            continue;
+        }
+
+        const bool aFpsOk = fpsRangeContains(a, kTargetPreviewFps);
+        const bool bFpsOk = fpsRangeContains(b, kTargetPreviewFps);
+        if (aFpsOk != bFpsOk) {
+            if (aFpsOk) {
+                outMode = candidate;
+            }
+            continue;
+        }
+
+        const int aResDelta = std::abs(ra.width() - kTargetPreviewWidth)
+                + std::abs(ra.height() - kTargetPreviewHeight);
+        const int bResDelta = std::abs(rb.width() - kTargetPreviewWidth)
+                + std::abs(rb.height() - kTargetPreviewHeight);
+        if (aResDelta != bResDelta) {
+            if (aResDelta < bResDelta) {
+                outMode = candidate;
+            }
+            continue;
+        }
+
+        const qreal aFpsDelta = fpsDistance(a, kTargetPreviewFps);
+        const qreal bFpsDelta = fpsDistance(b, kTargetPreviewFps);
+        if (std::abs(aFpsDelta - bFpsDelta) > 0.001) {
+            if (aFpsDelta < bFpsDelta) {
+                outMode = candidate;
+            }
+            continue;
+        }
+
+        const int aFmtScore = pixelFormatScore(a.pixelFormat());
+        const int bFmtScore = pixelFormatScore(b.pixelFormat());
+        if (aFmtScore != bFmtScore) {
+            if (aFmtScore > bFmtScore) {
+                outMode = candidate;
+            }
+            continue;
+        }
+
+        const qint64 aArea = static_cast<qint64>(ra.width()) * ra.height();
+        const qint64 bArea = static_cast<qint64>(rb.width()) * rb.height();
+        if (aArea > bArea) {
+            outMode = candidate;
+        }
+    }
+
+    if (!found) {
+        if (reason) {
+            *reason = QStringLiteral("No explicit viewfinder modes were exposed by the driver for this camera.");
+        }
+        return false;
+    }
+
+    if (reason) {
+        const QSize r = outMode.settings.resolution();
+        *reason = QString("selected mode: %1x%2 %3 fps[%4,%5]")
+                .arg(r.width())
+                .arg(r.height())
+                .arg(CameraProbe::pixelFormatToString(outMode.settings.pixelFormat()))
+                .arg(outMode.settings.minimumFrameRate(), 0, 'f', 2)
+                .arg(outMode.settings.maximumFrameRate(), 0, 'f', 2);
+    }
+    return true;
+}
+
 } // 匿名命名空间
 
 Widget::Widget(QWidget *parent)
@@ -135,6 +310,10 @@ Widget::Widget(QWidget *parent)
 Widget::~Widget()
 {
     // 析构顺序：先停数据链路（XDMA/预览），再释放 UI。
+    m_liveVideoSending = false;
+    if (m_probe) {
+        m_probe->stopCapture();
+    }
     closeXdmaHandles();
     stopPreview();
     delete ui;
@@ -146,6 +325,7 @@ void Widget::initializePreview()
     m_viewfinder = new QCameraViewfinder(this);
     m_viewfinder->setObjectName("cameraPreview");
     m_viewfinder->setMinimumHeight(280);
+    m_viewfinder->setAspectRatioMode(Qt::KeepAspectRatio);
 
     ui->verticalLayout->insertWidget(1, m_viewfinder, 1);
     initializeTransferControls();
@@ -374,6 +554,48 @@ void Widget::startPreview()
     m_previewCamera->setCaptureMode(QCamera::CaptureViewfinder);
     m_previewCamera->setViewfinder(m_viewfinder);
 
+    QCameraViewfinderSettings previewSettings;
+    CameraModeInfo chosenMode;
+    QString chooseReason;
+    const bool hasChosenMode = chooseFixedPreviewMode(info, chosenMode, &chooseReason);
+    bool chosenExactResolution = false;
+    if (hasChosenMode) {
+        previewSettings = chosenMode.settings;
+        const QSize chosenRes = chosenMode.settings.resolution();
+        chosenExactResolution = chosenRes.width() == kTargetPreviewWidth
+                && chosenRes.height() == kTargetPreviewHeight;
+        if (!chosenExactResolution) {
+            // 避免把“其它分辨率下有效”的像素格式硬绑到 640x360。
+            previewSettings.setPixelFormat(QVideoFrame::Format_Invalid);
+        }
+    } else {
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[WARN] Camera mode list unavailable. Will request fixed preview profile directly."));
+        if (!chooseReason.isEmpty()) {
+            ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + chooseReason);
+        }
+    }
+
+    // 固定请求 640x360 @ 30fps，若驱动不支持会回退到最接近模式。
+    previewSettings.setResolution(kTargetPreviewWidth, kTargetPreviewHeight);
+    previewSettings.setMinimumFrameRate(kTargetPreviewFps);
+    previewSettings.setMaximumFrameRate(kTargetPreviewFps);
+    m_previewCamera->setViewfinderSettings(previewSettings);
+
+    if (hasChosenMode && !chooseReason.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] Preview candidate: ") + chooseReason);
+        if (!chosenExactResolution) {
+            ui->plainTextEdit->appendPlainText(
+                        QStringLiteral("[WARN] Exact 640x360 mode was not enumerated. Driver will negotiate the closest mode."));
+        }
+    }
+    ui->plainTextEdit->appendPlainText(
+                QString("[INFO] Preview request profile: %1x%2 @ %3 fps, format=%4")
+                .arg(kTargetPreviewWidth)
+                .arg(kTargetPreviewHeight)
+                .arg(kTargetPreviewFps, 0, 'f', 1)
+                .arg(CameraProbe::pixelFormatToString(previewSettings.pixelFormat())));
+
     if (m_videoProbe) {
         if (!m_videoProbe->setSource(m_previewCamera)) {
             ui->plainTextEdit->appendPlainText(
@@ -420,12 +642,20 @@ void Widget::startPreview()
 // 停止并释放预览相机。
 void Widget::stopPreview()
 {
+    // 先解绑 probe，避免相机销毁时 probe 仍持有旧 source。
+    if (m_videoProbe) {
+        m_videoProbe->setSource(static_cast<QMediaObject *>(nullptr));
+    }
+
     if (!m_previewCamera) {
         return;
     }
 
+    disconnect(m_previewCamera, nullptr, this, nullptr);
+    m_previewCamera->setViewfinder(static_cast<QVideoWidget *>(nullptr));
     m_previewCamera->stop();
-    m_previewCamera->deleteLater();
+    m_previewCamera->unload();
+    delete m_previewCamera;
     m_previewCamera = nullptr;
 }
 
@@ -523,7 +753,7 @@ void Widget::on_btnGrabOneFrame_clicked()
 
     CameraModeInfo selected;
     QString reason;
-    if (CameraProbe::findPreferredYuy2Mode(640, 480, selected, &reason)) {
+    if (CameraProbe::findPreferredYuy2Mode(kTargetPreviewWidth, kTargetPreviewHeight, selected, &reason)) {
         ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + reason);
     } else {
         const QCameraInfo info = cameras.first();

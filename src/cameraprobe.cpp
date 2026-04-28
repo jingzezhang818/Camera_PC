@@ -1,6 +1,45 @@
 ﻿#include "cameraprobe.h"
 
 #include <QDebug>
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
+
+namespace {
+
+bool waitCameraReadyForModeQuery(QCamera &camera, int timeoutMs = 500)
+{
+    const auto isReady = [](QCamera::Status status) {
+        return status == QCamera::LoadedStatus
+                || status == QCamera::ActiveStatus
+                || status == QCamera::StandbyStatus;
+    };
+
+    if (isReady(camera.status())) {
+        return true;
+    }
+
+    camera.load();
+    if (isReady(camera.status())) {
+        return true;
+    }
+
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeoutMs) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        if (isReady(camera.status())) {
+            return true;
+        }
+        if (camera.status() == QCamera::UnavailableStatus) {
+            return false;
+        }
+    }
+
+    return isReady(camera.status());
+}
+
+} // namespace
 
 
 // ===== 模块：FrameGrabSurface（首帧采样 Surface）=====
@@ -158,6 +197,8 @@ QList<CameraModeInfo> CameraProbe::enumerateAllModes()
         const QCameraInfo &info = cameras[i];
 
         QCamera cam(info);
+        cam.setCaptureMode(QCamera::CaptureViewfinder);
+        waitCameraReadyForModeQuery(cam);
 
         // 路径 1：直接取完整 settings
         const QList<QCameraViewfinderSettings> settingsList = cam.supportedViewfinderSettings();
@@ -380,7 +421,7 @@ bool CameraProbe::startSingleFrameCapture(const CameraModeInfo &mode)
 }
 
 // 停止抓取并释放对象。
-// 注意：使用 deleteLater 与 Qt 事件循环配合，避免潜在重入风险。
+// 退出路径采用同步释放，降低应用关闭阶段的异步重入风险。
 void CameraProbe::stopCapture()
 {
     if (m_frameTimeout) {
@@ -388,13 +429,16 @@ void CameraProbe::stopCapture()
     }
 
     if (m_camera) {
+        disconnect(m_camera, nullptr, this, nullptr);
         m_camera->stop();
-        m_camera->deleteLater();
+        m_camera->unload();
+        delete m_camera;
         m_camera = nullptr;
     }
 
     if (m_surface) {
-        m_surface->deleteLater();
+        disconnect(m_surface, nullptr, this, nullptr);
+        delete m_surface;
         m_surface = nullptr;
     }
 }
