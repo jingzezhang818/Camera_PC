@@ -65,6 +65,11 @@ public:
     // 查询当前缓存区尚未输出的字节数（范围 [0, 当前批次大小)）。
     int pendingBytes() const;
 
+    // 仅执行协议封包，不参与批次聚合缓存。
+    // 返回值是连续的 1024B 定长包流，可直接发送到 XDMA。
+    QByteArray buildPacketStream(const QByteArray &videoPayload,
+                                 int *packetCount = nullptr) const;
+
     // ===== 诊断与自测 =====
     // 纯软件自测（不依赖 XDMA 设备）：
     // 校验包格式、length 编码、补零，以及“默认 1MiB”聚合边界行为。
@@ -72,7 +77,8 @@ public:
 
 private:
     // 内部封包函数：按协议切分为 1024B 定长包流。
-    // 每包 payload 有效长度写入 lengthH/lengthL，不足部分补 0。
+    // lengthH/lengthL 写入整包总长度（包头+payload，固定 1024B=0x0400），
+    // payload 不足部分补 0。
     QByteArray packetizeVideoPayload(const QByteArray &videoPayload,
                                      int *packetCount = nullptr) const;
 

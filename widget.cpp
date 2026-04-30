@@ -2,6 +2,7 @@
 #include "ui_widget.h"
 
 #include <QFile>
+#include <QFileInfo>
 #include <QDateTime>
 #include <QRegularExpression>
 #include <QImage>
@@ -180,8 +181,8 @@ void Widget::initializeTransferControls()
     QLabel *chunkLabel = new QLabel(
                 QString::fromWCharArray(L"\u5199\u5165\u5927\u5C0F(KB):"), panel);
     m_chunkSizeSpin = new QSpinBox(panel);
-    m_chunkSizeSpin->setRange(64, 4096);
-    m_chunkSizeSpin->setSingleStep(64);
+    m_chunkSizeSpin->setRange(1, 4096);
+    m_chunkSizeSpin->setSingleStep(1);
     m_chunkSizeSpin->setValue(m_xdmaChunkBytes / 1024);
 
     row->addWidget(throttleLabel);
@@ -562,17 +563,56 @@ void Widget::on_btnGrabOneFrame_clicked()
 void Widget::on_btnSendCapturedFrame_clicked()
 {
     // 解耦路径：采集与发送分离。
-    // 本按钮发送“采一帧”缓存下来的最后一帧数据。
-    if (m_lastCapturedFramePayload.isEmpty()) {
+    // 本按钮始终从“最近一次保存的 raw 文件”重读数据并发送，避免受内存态影响。
+    if (m_lastCapturedRawPath.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[ERROR] No captured frame cached. Please click \"采一帧\" first."));
+        return;
+    }
+
+    QFile rawFile(m_lastCapturedRawPath);
+    if (!rawFile.open(QIODevice::ReadOnly)) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[ERROR] Cannot open cached raw file: %1").arg(m_lastCapturedRawPath));
+        return;
+    }
+    const QByteArray rawPayload = rawFile.readAll();
+    rawFile.close();
+    if (rawPayload.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[ERROR] Cached raw file is empty: %1").arg(m_lastCapturedRawPath));
         return;
     }
 
     const QString label = m_lastCapturedFrameLabel.isEmpty()
             ? QStringLiteral("cached camera frame")
             : m_lastCapturedFrameLabel;
-    sendVideoPayloadWithBatching(m_lastCapturedFramePayload, label);
+    int packetCount = 0;
+    const QByteArray packetStream = m_videoPacketBatcher.buildPacketStream(rawPayload, &packetCount);
+    if (packetStream.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[ERROR] Packetization failed for cached raw: %1")
+                    .arg(m_lastCapturedRawPath));
+        return;
+    }
+
+    ui->plainTextEdit->appendPlainText(
+                QString("[PKG][DIRECT] %1 raw=%2B -> packets=%3 (%4B), source=%5")
+                .arg(label)
+                .arg(rawPayload.size())
+                .arg(packetCount)
+                .arg(packetStream.size())
+                .arg(m_lastCapturedRawPath));
+
+    const bool ok = sendXdmaPayload(packetStream,
+                                    QString("%1 [direct packet stream]").arg(label),
+                                    true,
+                                    false);
+    if (!ok) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[ERROR] Direct cached-frame send failed: %1")
+                    .arg(m_lastCapturedRawPath));
+    }
 }
 
 // 实时发送开关按钮。
@@ -615,6 +655,13 @@ void Widget::on_btnSendTestPacket_clicked()
     // 1) 验证 1024B 包头字段、length 与补零规则；
     // 2) 验证默认配置下 1024 包是否准确聚合为 1MiB。
     runPacketModuleSelfTest();
+}
+
+void Widget::on_btnClearLog_clicked()
+{
+    if (ui && ui->plainTextEdit) {
+        ui->plainTextEdit->clear();
+    }
 }
 
 // XDMA 链路测试包按钮槽。
@@ -679,15 +726,16 @@ void Widget::onProbeSuccess(const CapturedFrame &frame)
                 .arg(frame.planeCount)
                 .arg(frame.cameraDeviceName));
 
-    m_lastCapturedFramePayload = frame.payload;
+    m_lastCapturedRawPath = QFileInfo(file).absoluteFilePath();
     m_lastCapturedFrameLabel = QString("captured frame %1x%2 %3")
             .arg(frame.resolution.width())
             .arg(frame.resolution.height())
             .arg(CameraProbe::pixelFormatToString(frame.pixelFormat));
     ui->btnSendCapturedFrame->setEnabled(true);
     ui->plainTextEdit->appendPlainText(
-                QString("[INFO] Frame cached for manual XDMA send: %1 bytes")
-                .arg(m_lastCapturedFramePayload.size()));
+                QString("[INFO] Frame cached for manual XDMA send: %1 (%2 bytes)")
+                .arg(m_lastCapturedRawPath)
+                .arg(frame.payload.size()));
 
     if (frame.pixelFormat == QVideoFrame::Format_YUYV) {
         QImage image;
@@ -856,7 +904,7 @@ bool Widget::openXdmaAndSelfCheck()
     closeXdmaHandles();
 
     constexpr int kMaxDevices = 16;
-    constexpr size_t kPathLength = 1024;
+    constexpr size_t kPathLength = 1024; // 可以考虑改成260 + 1 以适配 Windows MAX_PATH，但目前驱动似乎不会返回过长路径。
 
     std::vector<QByteArray> pathBuffers;
     pathBuffers.reserve(kMaxDevices);

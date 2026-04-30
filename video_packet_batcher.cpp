@@ -9,8 +9,8 @@ VideoPacketBatcher::RouteFields VideoPacketBatcher::defaultRouteFields()
 {
     // 当前项目暂无外部路由配置入口，先用固定默认值集中管理。
     return RouteFields{
-        {0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
-        {0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
+        {0x00, 0x00, 0x00, 0x10, 0x20, 0x05}, //dest
+        {0x00, 0x00, 0x00, 0x00, 0x00, 0x02}, //sour
         {0x00, 0x01}
     };
 }
@@ -49,6 +49,12 @@ int VideoPacketBatcher::pendingBytes() const
     return m_batchCache.size();
 }
 
+QByteArray VideoPacketBatcher::buildPacketStream(const QByteArray &videoPayload,
+                                                 int *packetCount) const
+{
+    return packetizeVideoPayload(videoPayload, packetCount);
+}
+
 QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayload,
                                                      int *packetCount) const
 {
@@ -78,9 +84,9 @@ QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayl
         packet[0] = 0xEB;
         packet[1] = 0x90;
 
-        // lengthH/lengthL：写入 payload 实际长度（0~1006）。
-        packet[2] = static_cast<uchar>((payloadLen >> 8) & 0xFF);
-        packet[3] = static_cast<uchar>(payloadLen & 0xFF);
+        // lengthH/lengthL：协议定义为“整包总长度（包头+payload）”，固定 1024(0x0400)。
+        packet[2] = static_cast<uchar>((kPacketSize >> 8) & 0xFF);
+        packet[3] = static_cast<uchar>(kPacketSize & 0xFF);
 
         // 包头路由字段偏移：
         // [4..9] dest(6B), [10..15] source(6B), [16..17] priority(2B)。
@@ -176,13 +182,15 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
         if (!(pkt0[0] == 0xEB && pkt0[1] == 0x90 && pkt1[0] == 0xEB && pkt1[1] == 0x90)) {
             errors << QStringLiteral("frame header mismatch, expect EB 90");
         }
-        if (len0 != kPayloadSize) {
+        if (len0 != kPacketSize) {
             errors << QString("packet0 length mismatch, expect=%1 actual=%2")
-                      .arg(kPayloadSize)
+                      .arg(kPacketSize)
                       .arg(len0);
         }
-        if (len1 != 494) {
-            errors << QString("packet1 length mismatch, expect=494 actual=%1").arg(len1);
+        if (len1 != kPacketSize) {
+            errors << QString("packet1 length mismatch, expect=%1 actual=%2")
+                      .arg(kPacketSize)
+                      .arg(len1);
         }
 
         if (std::memcmp(pkt0 + 4, route.dest.data(), route.dest.size()) != 0

@@ -41,6 +41,7 @@ private slots:
     void on_btnOpenXdma_clicked();
     void on_btnSendLinkTestPacket_clicked();
     void on_btnSendTestPacket_clicked();
+    void on_btnClearLog_clicked();
 
     // ===== 回调槽：CameraProbe =====
     void onProbeLog(const QString &msg);
@@ -151,8 +152,8 @@ private:
     QLineEdit *m_regWriteValueEdit = nullptr;
     QLineEdit *m_regReadValueEdit = nullptr;
 
-    // 最近一次采集帧缓存，用于手动一键发送。
-    QByteArray m_lastCapturedFramePayload;
+    // 最近一次“采一帧”成功保存的 raw 文件路径与标签，用于手动一键发送。
+    QString m_lastCapturedRawPath;
     QString m_lastCapturedFrameLabel;
 
     // 视频流封包+聚合模块（1024B 包 -> 可配置批次，默认 1MiB）。

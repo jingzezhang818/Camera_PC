@@ -59,14 +59,21 @@
       </widget>
      </item>
      <item>
-      <widget class="QPushButton" name="btnSendTestPacket">
-       <property name="text">
-        <string>运行协议封包自测</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <spacer name="horizontalSpacer">
+     <widget class="QPushButton" name="btnSendTestPacket">
+      <property name="text">
+       <string>运行协议封包自测</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QPushButton" name="btnClearLog">
+      <property name="text">
+       <string>清空日志</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <spacer name="horizontalSpacer">
        <property name="orientation">
         <enum>Qt::Horizontal</enum>
        </property>

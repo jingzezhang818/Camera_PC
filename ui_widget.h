@@ -32,6 +32,7 @@ public:
     QPushButton *btnOpenXdma;
     QPushButton *btnSendLinkTestPacket;
     QPushButton *btnSendTestPacket;
+    QPushButton *btnClearLog;
     QSpacerItem *horizontalSpacer;
     QPlainTextEdit *plainTextEdit;
 
@@ -79,6 +80,11 @@ public:
 
         horizontalLayout->addWidget(btnSendTestPacket);
 
+        btnClearLog = new QPushButton(Widget);
+        btnClearLog->setObjectName(QString::fromUtf8("btnClearLog"));
+
+        horizontalLayout->addWidget(btnClearLog);
+
         horizontalSpacer = new QSpacerItem(40, 20, QSizePolicy::Expanding, QSizePolicy::Minimum);
 
         horizontalLayout->addItem(horizontalSpacer);
@@ -108,6 +114,7 @@ public:
         btnOpenXdma->setText(QApplication::translate("Widget", "\346\211\223\345\274\200XDMA\351\200\232\351\201\223\345\271\266\350\207\252\346\243\200", nullptr));
         btnSendLinkTestPacket->setText(QApplication::translate("Widget", "\345\217\221\351\200\201XDMA\351\223\276\350\267\257\346\265\213\350\257\225\345\214\205", nullptr));
         btnSendTestPacket->setText(QApplication::translate("Widget", "\350\277\220\350\241\214\345\215\217\350\256\256\345\260\201\345\214\205\350\207\252\346\265\213", nullptr));
+        btnClearLog->setText(QApplication::translate("Widget", "\346\270\205\347\251\272\346\227\245\345\277\227", nullptr));
     } // retranslateUi
 
 };
