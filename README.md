@@ -124,3 +124,5 @@
 
 - 默认路由字段在 `VideoPacketBatcher::defaultRouteFields()` 集中配置。
 - 寄存器读写走 user 通道，不经过 h2c_0 视频发送路径。
+
+0x15004 0x00101005

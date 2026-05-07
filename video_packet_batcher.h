@@ -67,8 +67,10 @@ public:
 
     // 仅执行协议封包，不参与批次聚合缓存。
     // 返回值是连续的 1024B 定长包流，可直接发送到 XDMA。
+    // minPacketCount>0 时，若按 payload 计算的包数不足该值，会在末尾补全空包。
     QByteArray buildPacketStream(const QByteArray &videoPayload,
-                                 int *packetCount = nullptr) const;
+                                 int *packetCount = nullptr,
+                                 int minPacketCount = 0) const;
 
     // ===== 诊断与自测 =====
     // 纯软件自测（不依赖 XDMA 设备）：
@@ -78,9 +80,10 @@ public:
 private:
     // 内部封包函数：按协议切分为 1024B 定长包流。
     // lengthH/lengthL 写入整包总长度（包头+payload，固定 1024B=0x0400），
-    // payload 不足部分补 0。
+    // payload 不足部分补 0；如果 minPacketCount 更大则继续补“全零 payload 包”。
     QByteArray packetizeVideoPayload(const QByteArray &videoPayload,
-                                     int *packetCount = nullptr) const;
+                                     int *packetCount = nullptr,
+                                     int minPacketCount = 0) const;
 
     RouteFields m_routeFields;
     int m_batchBytes = kBatchBytes;

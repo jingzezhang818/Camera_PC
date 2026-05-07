@@ -50,19 +50,21 @@ int VideoPacketBatcher::pendingBytes() const
 }
 
 QByteArray VideoPacketBatcher::buildPacketStream(const QByteArray &videoPayload,
-                                                 int *packetCount) const
+                                                 int *packetCount,
+                                                 int minPacketCount) const
 {
-    return packetizeVideoPayload(videoPayload, packetCount);
+    return packetizeVideoPayload(videoPayload, packetCount, minPacketCount);
 }
 
 QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayload,
-                                                     int *packetCount) const
+                                                     int *packetCount,
+                                                     int minPacketCount) const
 {
     if (packetCount) {
         *packetCount = 0;
     }
 
-    if (videoPayload.isEmpty()) {
+    if (videoPayload.isEmpty() && minPacketCount <= 0) {
         return {};
     }
 
@@ -70,7 +72,8 @@ QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayl
     // - 每 1006B 生成 1 包；
     // - 最后一包不足 1006B 也必须生成。
     const int totalBytes = videoPayload.size();
-    const int localPacketCount = (totalBytes + kPayloadSize - 1) / kPayloadSize;
+    const int packetCountByPayload = (totalBytes + kPayloadSize - 1) / kPayloadSize;
+    const int localPacketCount = qMax(packetCountByPayload, qMax(0, minPacketCount));
 
     QByteArray packetStream(localPacketCount * kPacketSize, '\0');
     const char *src = videoPayload.constData();

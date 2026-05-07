@@ -587,8 +587,11 @@ void Widget::on_btnSendCapturedFrame_clicked()
     const QString label = m_lastCapturedFrameLabel.isEmpty()
             ? QStringLiteral("cached camera frame")
             : m_lastCapturedFrameLabel;
+    constexpr int kCachedFrameFixedPacketCount = 460;
     int packetCount = 0;
-    const QByteArray packetStream = m_videoPacketBatcher.buildPacketStream(rawPayload, &packetCount);
+    const QByteArray packetStream = m_videoPacketBatcher.buildPacketStream(rawPayload,
+                                                                           &packetCount,
+                                                                           kCachedFrameFixedPacketCount);
     if (packetStream.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
                     QString("[ERROR] Packetization failed for cached raw: %1")
@@ -597,11 +600,12 @@ void Widget::on_btnSendCapturedFrame_clicked()
     }
 
     ui->plainTextEdit->appendPlainText(
-                QString("[PKG][DIRECT] %1 raw=%2B -> packets=%3 (%4B), source=%5")
+                QString("[PKG][DIRECT] %1 raw=%2B -> packets=%3 (%4B), fixed-min=%5, source=%6")
                 .arg(label)
                 .arg(rawPayload.size())
                 .arg(packetCount)
                 .arg(packetStream.size())
+                .arg(kCachedFrameFixedPacketCount)
                 .arg(m_lastCapturedRawPath));
 
     const bool ok = sendXdmaPayload(packetStream,
