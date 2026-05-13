@@ -1,31 +1,33 @@
 # Camera PC Linux GUI
 
-基于 Qt Widgets 的 Linux 上位机程序，功能对齐 Windows 版本。
+基于 Qt Widgets 的 Linux 上位机程序，目标是与 Windows 版本保持功能一致。
 
-## 项目结构
+当前开发分支：`linux-support`
 
-```
-camera_PC_linux_cli/
-├── CMakeLists.txt          # CMake 构建配置
-├── README.md               # 本文件
+## 代码结构
+
+```text
+Camera_PC/
+├── CMakeLists.txt
+├── README.md
+├── load_xdma.sh
 ├── include/
-│   ├── cameraprobe.h       # 相机模式枚举与单帧抓取
-│   ├── video_packet_batcher.h  # 1024B 协议封包与 1MiB 批量聚合
-│   ├── widget.h            # 主界面声明
-│   └── xdmaDLL_public_linux.h  # Linux XDMA 接口声明与兼容类型
-├── src/
-│   ├── XDMA_MoreB_linux.cc # XDMA Linux 实现（/dev/xdma*）
-│   ├── cameraprobe.cpp     # 相机模式枚举与单帧抓取实现
-│   ├── main.cpp            # Qt 程序入口
-│   ├── video_packet_batcher.cpp  # 协议封包与批量聚合实现
-│   ├── widget.cpp          # 主界面与业务流程实现
-│   └── widget.ui           # Qt UI 描述文件
-└── build/                  # 编译输出目录（不提交）
+│   ├── cameraprobe.h
+│   ├── video_packet_batcher.h
+│   ├── widget.h
+│   └── xdmaDLL_public_linux.h
+└── src/
+    ├── XDMA_MoreB_linux.cc
+    ├── cameraprobe.cpp
+    ├── main.cpp
+    ├── video_packet_batcher.cpp
+    ├── widget.cpp
+    └── widget.ui
 ```
 
-## 从克隆到运行
+## 快速开始
 
-### 1. 克隆代码
+### 1. 获取代码并切到 Linux 分支
 
 ```bash
 git clone https://github.com/jingzezhang818/Camera_PC.git
@@ -41,6 +43,7 @@ sudo apt install -y \
   build-essential cmake pkg-config \
   qtbase5-dev qtmultimedia5-dev qttools5-dev-tools \
   libqt5multimedia5-plugins libqt5multimediawidgets5 \
+  v4l-utils \
   fonts-noto-cjk fonts-wqy-microhei fonts-wqy-zenhei
 ```
 
@@ -48,23 +51,39 @@ sudo apt install -y \
 
 ```bash
 cmake -S . -B build
-cmake --build build -j
+cmake --build build -j"$(nproc)"
 ```
 
-### 4. 运行
+### 4. 加载 XDMA 驱动并运行 GUI
 
 ```bash
+./load_xdma.sh
 ./build/camera_pc_gui
 ```
 
-## 设备检查
+说明：
+- `load_xdma.sh` 会在需要时自动通过 `sudo` 提权，不需要手动 `sudo su`。
+- 默认以 MSI 模式加载驱动，等价于 `./load_xdma.sh 1`。
+
+## XDMA 驱动前置条件
+
+`load_xdma.sh` 默认会查找以下目录：
+
+```text
+../dma_ip_drivers/XDMA/linux-kernel/tests
+```
+
+请确认该目录存在，并且其中包含 `load_driver.sh`。
+
+## 常用检查命令
 
 ```bash
 ls /dev/video*
 v4l2-ctl --list-devices
+ls /dev/xdma*
 ```
 
 ## 备注
 
-- `ready_state`、`reset` 的返回语义直接透传底层 XDMA 接口
-- TODO：`op_state`、`ddr_state` 的寄存器语义需以 FPGA 文档为准
+- `ready_state`、`reset` 返回值语义目前直接透传底层 XDMA 接口。
+- `op_state`、`ddr_state` 的寄存器语义仍需与 FPGA 文档最终对齐。

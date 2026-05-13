@@ -9,7 +9,7 @@ VideoPacketBatcher::RouteFields VideoPacketBatcher::defaultRouteFields()
 {
     // 当前项目暂无外部路由配置入口，先用固定默认值集中管理。
     return RouteFields{
-        {0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+        {0x00, 0x00, 0x00, 0x10, 0x20, 0x05},
         {0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
         {0x00, 0x01}
     };
@@ -49,6 +49,11 @@ int VideoPacketBatcher::pendingBytes() const
     return m_batchCache.size();
 }
 
+void VideoPacketBatcher::clearPendingCache()
+{
+    m_batchCache.clear();
+}
+
 QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayload,
                                                      int *packetCount) const
 {
@@ -78,9 +83,9 @@ QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayl
         packet[0] = 0xEB;
         packet[1] = 0x90;
 
-        // lengthH/lengthL：写入 payload 实际长度（0~1006）。
-        packet[2] = static_cast<uchar>((payloadLen >> 8) & 0xFF);
-        packet[3] = static_cast<uchar>(payloadLen & 0xFF);
+        // lengthH/lengthL：完整包长，包含包头和 payload，固定为 0x0400。
+        packet[2] = static_cast<uchar>((kPacketSize >> 8) & 0xFF);
+        packet[3] = static_cast<uchar>(kPacketSize & 0xFF);
 
         // 包头路由字段偏移：
         // [4..9] dest(6B), [10..15] source(6B), [16..17] priority(2B)。
@@ -107,7 +112,8 @@ QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayl
 
 VideoPacketBatcher::EnqueueResult VideoPacketBatcher::enqueueVideoPayload(
         const QByteArray &videoPayload,
-        QVector<QByteArray> &outBatches)
+        QVector<QByteArray> &outBatches,
+        bool flushTail)
 {
     EnqueueResult result;
     result.inputBytes = videoPayload.size();
@@ -133,10 +139,17 @@ VideoPacketBatcher::EnqueueResult VideoPacketBatcher::enqueueVideoPayload(
             // 每凑满一个批次输出一次，剩余字节继续缓存。
             outBatches.append(m_batchCache.left(m_batchBytes));
             m_batchCache.remove(0, m_batchBytes);
+            result.emittedBatchBytes += m_batchBytes;
         }
     }
 
-    result.emittedBatchBytes = result.emittedBatchCount * m_batchBytes;
+    if (flushTail && !m_batchCache.isEmpty()) {
+        outBatches.append(m_batchCache);
+        ++result.emittedBatchCount;
+        result.emittedBatchBytes += m_batchCache.size();
+        m_batchCache.clear();
+    }
+
     result.cachedBytes = m_batchCache.size();
     return result;
 }
@@ -148,7 +161,7 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
     QStringList errors;
     const RouteFields route = defaultRouteFields();
 
-    // 样本 1：1500B，验证拆包、length、补零、路由字段偏移。
+    // 样本 1：1500B，验证拆包、固定总包长、补零、路由字段偏移。
     QByteArray sample(1500, '\0');
     for (int i = 0; i < sample.size(); ++i) {
         sample[i] = static_cast<char>(i & 0xFF);
@@ -176,13 +189,15 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
         if (!(pkt0[0] == 0xEB && pkt0[1] == 0x90 && pkt1[0] == 0xEB && pkt1[1] == 0x90)) {
             errors << QStringLiteral("frame header mismatch, expect EB 90");
         }
-        if (len0 != kPayloadSize) {
+        if (len0 != kPacketSize) {
             errors << QString("packet0 length mismatch, expect=%1 actual=%2")
-                      .arg(kPayloadSize)
+                      .arg(kPacketSize)
                       .arg(len0);
         }
-        if (len1 != 494) {
-            errors << QString("packet1 length mismatch, expect=494 actual=%1").arg(len1);
+        if (len1 != kPacketSize) {
+            errors << QString("packet1 length mismatch, expect=%1 actual=%2")
+                      .arg(kPacketSize)
+                      .arg(len1);
         }
 
         if (std::memcmp(pkt0 + 4, route.dest.data(), route.dest.size()) != 0

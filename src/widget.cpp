@@ -360,8 +360,9 @@ void Widget::initializeTransferControls()
     QLabel *chunkLabel = new QLabel(
                 QString::fromWCharArray(L"\u5199\u5165\u5927\u5C0F(KB):"), panel);
     m_chunkSizeSpin = new QSpinBox(panel);
-    m_chunkSizeSpin->setRange(64, 4096);
-    m_chunkSizeSpin->setSingleStep(64);
+    // 允许按 1KB 粒度调节，最小 1KB（正好 1 个协议包）。
+    m_chunkSizeSpin->setRange(1, 4096);
+    m_chunkSizeSpin->setSingleStep(1);
     m_chunkSizeSpin->setValue(m_xdmaChunkBytes / 1024);
 
     row->addWidget(throttleLabel);
@@ -792,17 +793,39 @@ void Widget::on_btnGrabOneFrame_clicked()
 void Widget::on_btnSendCapturedFrame_clicked()
 {
     // 解耦路径：采集与发送分离。
-    // 本按钮发送“采一帧”缓存下来的最后一帧数据。
-    if (m_lastCapturedFramePayload.isEmpty()) {
-        ui->plainTextEdit->appendPlainText(
-                    QStringLiteral("[ERROR] No captured frame cached. Please click \"采一帧\" first."));
-        return;
+    // 优先发送内存中的“最近一次抓取成功帧”，确保总是使用最新缓存图像。
+    QByteArray payload = m_lastCapturedFramePayload;
+    QString label = m_lastCapturedFrameLabel;
+    if (payload.isEmpty()) {
+        // 兜底：兼容旧流程（仅记录了落盘路径时）。
+        if (m_lastSavedRawFilePath.isEmpty()) {
+            ui->plainTextEdit->appendPlainText(
+                        QStringLiteral("[ERROR] No cached frame. Please click \"采一帧\" first."));
+            return;
+        }
+
+        QFile file(m_lastSavedRawFilePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            ui->plainTextEdit->appendPlainText(
+                        QString("[ERROR] Cannot open saved raw file: %1")
+                        .arg(m_lastSavedRawFilePath));
+            return;
+        }
+
+        payload = file.readAll();
+        file.close();
+
+        if (payload.isEmpty()) {
+            ui->plainTextEdit->appendPlainText(
+                        QString("[ERROR] Saved raw file is empty: %1")
+                        .arg(m_lastSavedRawFilePath));
+            return;
+        }
+
+        label = QString("saved raw %1").arg(m_lastSavedRawFilePath);
     }
 
-    const QString label = m_lastCapturedFrameLabel.isEmpty()
-            ? QStringLiteral("cached camera frame")
-            : m_lastCapturedFrameLabel;
-    sendVideoPayloadWithBatching(m_lastCapturedFramePayload, label);
+    sendVideoPayloadWithBatching(payload, label, true, true);
 }
 
 // 实时发送开关按钮。
@@ -863,11 +886,18 @@ void Widget::onProbeLog(const QString &msg)
 }
 
 // 单帧抓取成功回调：
-// 1) 保存 raw；
-// 2) 缓存 payload 供手动 XDMA 发送；
+// 1) 刷新“最近一次帧”内存缓存，供手动 XDMA 发送优先使用；
+// 2) 保存 raw 到磁盘，便于落盘留存与离线分析；
 // 3) 若格式是 YUYV，则额外导出 PNG 预览。
 void Widget::onProbeSuccess(const CapturedFrame &frame)
 {
+    m_lastCapturedFramePayload = frame.payload;
+    m_lastCapturedFrameLabel = QString("cached frame %1x%2 %3")
+            .arg(frame.resolution.width())
+            .arg(frame.resolution.height())
+            .arg(CameraProbe::pixelFormatToString(frame.pixelFormat));
+    ui->btnSendCapturedFrame->setEnabled(!m_lastCapturedFramePayload.isEmpty());
+
     QString fmtTag = CameraProbe::pixelFormatToString(frame.pixelFormat).toLower();
     fmtTag.replace(QRegularExpression("[^a-z0-9]+"), "_");
     if (fmtTag.isEmpty()) {
@@ -909,15 +939,10 @@ void Widget::onProbeSuccess(const CapturedFrame &frame)
                 .arg(frame.planeCount)
                 .arg(frame.cameraDeviceName));
 
-    m_lastCapturedFramePayload = frame.payload;
-    m_lastCapturedFrameLabel = QString("captured frame %1x%2 %3")
-            .arg(frame.resolution.width())
-            .arg(frame.resolution.height())
-            .arg(CameraProbe::pixelFormatToString(frame.pixelFormat));
-    ui->btnSendCapturedFrame->setEnabled(true);
+    m_lastSavedRawFilePath = fileName;
     ui->plainTextEdit->appendPlainText(
-                QString("[INFO] Frame cached for manual XDMA send: %1 bytes")
-                .arg(m_lastCapturedFramePayload.size()));
+                QString("[INFO] Cached frame refreshed for manual XDMA send; saved raw file: %1")
+                .arg(m_lastSavedRawFilePath));
 
     if (frame.pixelFormat == QVideoFrame::Format_YUYV) {
         QImage image;
@@ -1331,6 +1356,7 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
     }
 
     HANDLE h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
+    bool autoOpenedThisSend = false;
     if (!isValidHandle(h2c)) {
         ui->plainTextEdit->appendPlainText(QStringLiteral("[XDMA] h2c_0 is not open, trying auto-open..."));
         if (!openXdmaAndSelfCheck()) {
@@ -1338,6 +1364,7 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
             return false;
         }
         h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
+        autoOpenedThisSend = true;
     }
 
     if (!isValidHandle(h2c)) {
@@ -1356,15 +1383,31 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
 
     std::memcpy(txBuffer, payload.constData(), static_cast<size_t>(totalBytes));
 
+    const auto writeSingle = [&](HANDLE handle) -> int {
+        return write_device(handle,
+                            0x00000000,
+                            static_cast<DWORD>(totalBytes),
+                            txBuffer);
+    };
+
     int sent = 0;
     if (forceSingleWrite) {
         // 视频批次路径要求“一批一写”：
         // 若驱动返回值不是 totalBytes，视为失败并立即上报，避免
         // 上层误以为该批已经完整送达 FPGA。
-        const int written = write_device(h2c,
-                                         0x00000000,
-                                         static_cast<DWORD>(totalBytes),
-                                         txBuffer);
+        int written = writeSingle(h2c);
+        if (written != totalBytes && autoOpenedThisSend) {
+            ui->plainTextEdit->appendPlainText(
+                        QString("[WARN] First write after auto-open failed for %1: ret=%2, retrying once...")
+                        .arg(label)
+                        .arg(written));
+            if (openXdmaAndSelfCheck()) {
+                h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
+                if (isValidHandle(h2c)) {
+                    written = writeSingle(h2c);
+                }
+            }
+        }
         if (written != totalBytes) {
             free_buffer(txBuffer);
             ui->plainTextEdit->appendPlainText(
@@ -1413,7 +1456,8 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
 // 原始视频字节流 -> 1024B 封包 -> 可配置批次聚合 -> XDMA 发送。
 bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                           const QString &label,
-                                          bool verbose)
+                                          bool verbose,
+                                          bool isolatePayload)
 {
     if (videoPayload.isEmpty()) {
         ui->plainTextEdit->appendPlainText(QString("[ERROR] %1 is empty, skip video packetization.").arg(label));
@@ -1421,28 +1465,41 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
     }
 
     QVector<QByteArray> readyBatches;
+    if (isolatePayload) {
+        const int droppedBytes = m_videoPacketBatcher.pendingBytes();
+        if (droppedBytes > 0) {
+            ui->plainTextEdit->appendPlainText(
+                        QString("[PKG] %1 isolate send: drop stale cache=%2B")
+                        .arg(label)
+                        .arg(droppedBytes));
+        }
+        m_videoPacketBatcher.clearPendingCache();
+    }
+
     const VideoPacketBatcher::EnqueueResult result =
-            m_videoPacketBatcher.enqueueVideoPayload(videoPayload, readyBatches);
+            m_videoPacketBatcher.enqueueVideoPayload(videoPayload,
+                                                     readyBatches,
+                                                     isolatePayload);
 
     // [PKG] 日志用于观察三层关系：
     // - raw：输入原始视频字节数；
     // - packets：本次封包后的 1024B 包数量；
     // - emitted/cached：本次发出的“当前配置批次”数量与剩余缓存字节。
     if (verbose || !readyBatches.isEmpty()) {
-        const int batchKB = m_videoPacketBatcher.batchBytes() / 1024;
         ui->plainTextEdit->appendPlainText(
-                    QString("[PKG] %1 raw=%2B -> packets=%3 (%4B), emitted=%5 x %6KB, cached=%7B")
+                    QString("[PKG] %1 raw=%2B -> packets=%3 (%4B), emitted=%5B (%6 batches), cached=%7B")
                     .arg(label)
                     .arg(result.inputBytes)
                     .arg(result.packetCount)
                     .arg(result.packetBytes)
+                    .arg(result.emittedBatchBytes)
                     .arg(result.emittedBatchCount)
-                    .arg(batchKB)
                     .arg(result.cachedBytes));
     }
 
     for (int i = 0; i < readyBatches.size(); ++i) {
-        // 每个 readyBatches[i] 必然是完整批次，且在此处强制单次 write。
+        // 默认是完整批次；isolatePayload=true 时最后一个可能是尾包。
+        // 在此统一强制单次 write，保证“一个输出块对应一次写入”。
         const int batchKB = readyBatches[i].size() / 1024;
         const bool ok = sendXdmaPayload(readyBatches[i],
                                         QString("%1 [%2KB batch %3/%4]")

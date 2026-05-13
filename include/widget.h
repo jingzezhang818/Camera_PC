@@ -71,7 +71,8 @@ private:
     // 原始视频流 -> 1024B 协议封包 -> 可配置批次聚合 -> sendXdmaPayload(single write)。
     bool sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                       const QString &label,
-                                      bool verbose = true);
+                                      bool verbose = true,
+                                      bool isolatePayload = false);
 
     // 软件自测入口（纯内存，不依赖 XDMA 设备），改为“手动触发”。
     void runPacketModuleSelfTest();
@@ -151,7 +152,9 @@ private:
     QLineEdit *m_regWriteValueEdit = nullptr;
     QLineEdit *m_regReadValueEdit = nullptr;
 
-    // 最近一次采集帧缓存，用于手动一键发送。
+    // 最近一次成功保存的 raw 文件路径（用于落盘记录与兜底读取）。
+    QString m_lastSavedRawFilePath;
+    // 最近一次抓取成功的图像帧缓存（内存态），手动发送优先使用该缓存。
     QByteArray m_lastCapturedFramePayload;
     QString m_lastCapturedFrameLabel;
 

@@ -59,11 +59,16 @@ public:
 
     // 原始视频字节流 -> 协议包流 -> 固定批次输出（批次大小可配置）。
     // outBatches 只返回本次刚凑满的批次；不足一个批次的尾部保留在内部缓存。
+    // flushTail=true 时会把尾部缓存也作为最后一个批次输出并清空缓存。
     EnqueueResult enqueueVideoPayload(const QByteArray &videoPayload,
-                                      QVector<QByteArray> &outBatches);
+                                      QVector<QByteArray> &outBatches,
+                                      bool flushTail = false);
 
     // 查询当前缓存区尚未输出的字节数（范围 [0, 当前批次大小)）。
     int pendingBytes() const;
+
+    // 清空内部聚合缓存。
+    void clearPendingCache();
 
     // ===== 诊断与自测 =====
     // 纯软件自测（不依赖 XDMA 设备）：
@@ -72,7 +77,7 @@ public:
 
 private:
     // 内部封包函数：按协议切分为 1024B 定长包流。
-    // 每包 payload 有效长度写入 lengthH/lengthL，不足部分补 0。
+    // 每包 lengthH/lengthL 固定写入完整包长 0x0400，不足 payload 部分补 0。
     QByteArray packetizeVideoPayload(const QByteArray &videoPayload,
                                      int *packetCount = nullptr) const;
 
