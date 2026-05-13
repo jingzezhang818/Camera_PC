@@ -30,6 +30,7 @@ public:
         int emittedBatchCount = 0;
         int emittedBatchBytes = 0;
         int cachedBytes = 0;
+        int pendingPayloadBytes = 0;
     };
 
     // 协议常量：
@@ -57,13 +58,17 @@ public:
     // 查询当前聚合批次大小（单位：字节）。
     int batchBytes() const;
 
-    // 原始视频字节流 -> 协议包流 -> 固定批次输出（批次大小可配置）。
-    // outBatches 只返回本次刚凑满的批次；不足一个批次的尾部保留在内部缓存。
+    // 流式输入字节 -> 协议包流 -> 固定批次输出（批次大小可配置）。
+    // 1) 仅当累计满 1006B 才产生 1 个协议包；
+    // 2) 本接口不会在每次输入末尾强行补零收尾；
+    // 3) 不足 1006B 的尾部原始字节保留到下次继续拼接。
     EnqueueResult enqueueVideoPayload(const QByteArray &videoPayload,
                                       QVector<QByteArray> &outBatches);
 
-    // 查询当前缓存区尚未输出的字节数（范围 [0, 当前批次大小)）。
+    // 查询当前缓存区尚未输出的字节数（协议包缓存 + 原始尾部缓存）。
     int pendingBytes() const;
+    int pendingPayloadBytes() const;
+    void discardPendingPayloadBytes();
 
     // 仅执行协议封包，不参与批次聚合缓存。
     // 返回值是连续的 1024B 定长包流，可直接发送到 XDMA。
@@ -88,6 +93,7 @@ private:
     RouteFields m_routeFields;
     int m_batchBytes = kBatchBytes;
     QByteArray m_batchCache;
+    QByteArray m_payloadCache;
 };
 
 #endif // VIDEO_PACKET_BATCHER_H

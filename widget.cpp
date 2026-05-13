@@ -628,19 +628,27 @@ void Widget::on_btnSendLiveVideo_clicked()
     if (!m_liveVideoSending) {
         m_liveVideoSending = true;
         m_lastLiveSendMs = 0;
-        m_liveSentFrames = 0;
+        m_liveSentBatches = 0;
         ui->btnSendLiveVideo->setText(QString::fromUtf8("停止实时视频发送(封包+批量)"));
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[XDMA] Live camera streaming to h2c_0 started."));
         return;
     }
 
+    const int droppedPayloadBytes = m_videoPacketBatcher.pendingPayloadBytes();
+    m_videoPacketBatcher.discardPendingPayloadBytes();
+    int queuedBatchBytes = 0;
+    for (const QByteArray &batch : m_liveReadyBatches) {
+        queuedBatchBytes += batch.size();
+    }
+
     m_liveVideoSending = false;
     ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
     ui->plainTextEdit->appendPlainText(
-                QString("[XDMA] Live camera streaming stopped. sent frames=%1, cached-not-sent=%2 bytes")
-                .arg(m_liveSentFrames)
-                .arg(m_videoPacketBatcher.pendingBytes()));
+                QString("[XDMA] Live camera streaming stopped. sent batches=%1, cached-not-sent=%2 bytes, dropped-tail=%3 bytes")
+                .arg(m_liveSentBatches)
+                .arg(m_videoPacketBatcher.pendingBytes() + queuedBatchBytes)
+                .arg(droppedPayloadBytes));
 }
 
 // ----- 子模块：XDMA 与测试按钮 -----
@@ -806,13 +814,6 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         return;
     }
 
-    // 发送节流：限制发送速率，避免 PCIe/H2C 被灌满，
-    // 同时降低 GUI 线程压力。
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    if (m_lastLiveSendMs > 0 && (nowMs - m_lastLiveSendMs) < m_liveStreamThrottleMs) {
-        return;
-    }
-
     if (!frame.isValid()) {
         return;
     }
@@ -841,13 +842,17 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         return;
     }
 
-    m_lastLiveSendMs = nowMs;
+    // 发送节流仅限制“写 XDMA”频率，输入流数据不丢弃。
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const bool allowSendNow =
+            (m_lastLiveSendMs <= 0) || ((nowMs - m_lastLiveSendMs) >= m_liveStreamThrottleMs);
     const bool ok = sendVideoPayloadWithBatching(payload,
                                                  QString("live frame %1x%2 %3")
                                                  .arg(width)
                                                  .arg(height)
                                                  .arg(CameraProbe::pixelFormatToString(fmt)),
-                                                 false);
+                                                 false,
+                                                 allowSendNow);
 
     if (!ok) {
         // 发送失败即停流，避免持续错误刷屏和驱动压力累积。
@@ -858,12 +863,6 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         return;
     }
 
-    ++m_liveSentFrames;
-    if ((m_liveSentFrames % 30) == 0) {
-        ui->plainTextEdit->appendPlainText(
-                    QString("[XDMA] Live stream progress: sent frames=%1")
-                    .arg(m_liveSentFrames));
-    }
 }
 
 // ===== 模块：传输与 XDMA 底层实现 =====
@@ -1235,7 +1234,8 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
 // 原始视频字节流 -> 1024B 封包 -> 可配置批次聚合 -> XDMA 发送。
 bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                           const QString &label,
-                                          bool verbose)
+                                          bool verbose,
+                                          bool allowSendNow)
 {
     if (videoPayload.isEmpty()) {
         ui->plainTextEdit->appendPlainText(QString("[ERROR] %1 is empty, skip video packetization.").arg(label));
@@ -1245,33 +1245,49 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
     QVector<QByteArray> readyBatches;
     const VideoPacketBatcher::EnqueueResult result =
             m_videoPacketBatcher.enqueueVideoPayload(videoPayload, readyBatches);
+    for (const QByteArray &batch : readyBatches) {
+        m_liveReadyBatches.append(batch);
+    }
 
     // [PKG] 日志用于观察三层关系：
     // - raw：输入原始视频字节数；
     // - packets：本次封包后的 1024B 包数量；
-    // - emitted/cached：本次发出的“当前配置批次”数量与剩余缓存字节。
+    // - emitted/cached：本次产出的完整批次、累计待发批次与缓存字节。
     if (verbose || !readyBatches.isEmpty()) {
         const int batchKB = m_videoPacketBatcher.batchBytes() / 1024;
+        int queuedBatchBytes = 0;
+        for (const QByteArray &batch : m_liveReadyBatches) {
+            queuedBatchBytes += batch.size();
+        }
         ui->plainTextEdit->appendPlainText(
-                    QString("[PKG] %1 raw=%2B -> packets=%3 (%4B), emitted=%5 x %6KB, cached=%7B")
+                    QString("[PKG] %1 raw=%2B -> packets=%3 (%4B), produced=%5 x %6KB, queued=%7 x %6KB (%8B), cached=%9B, payload-tail=%10B")
                     .arg(label)
                     .arg(result.inputBytes)
                     .arg(result.packetCount)
                     .arg(result.packetBytes)
-                    .arg(result.emittedBatchCount)
+                    .arg(readyBatches.size())
                     .arg(batchKB)
-                    .arg(result.cachedBytes));
+                    .arg(m_liveReadyBatches.size())
+                    .arg(queuedBatchBytes)
+                    .arg(result.cachedBytes)
+                    .arg(result.pendingPayloadBytes));
     }
 
-    for (int i = 0; i < readyBatches.size(); ++i) {
-        // 每个 readyBatches[i] 必然是完整批次，且在此处强制单次 write。
-        const int batchKB = readyBatches[i].size() / 1024;
-        const bool ok = sendXdmaPayload(readyBatches[i],
+    if (!allowSendNow || m_liveReadyBatches.isEmpty()) {
+        return true;
+    }
+
+    const int totalBatches = m_liveReadyBatches.size();
+    for (int i = 0; i < totalBatches; ++i) {
+        // 仅在节流时间窗到达时发送，并保持“一批次一次写”。
+        const QByteArray batch = m_liveReadyBatches.first();
+        const int batchKB = batch.size() / 1024;
+        const bool ok = sendXdmaPayload(batch,
                                         QString("%1 [%2KB batch %3/%4]")
                                         .arg(label)
                                         .arg(batchKB)
                                         .arg(i + 1)
-                                        .arg(readyBatches.size()),
+                                        .arg(totalBatches),
                                         false,
                                         true);
         if (!ok) {
@@ -1281,8 +1297,16 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                         .arg(i + 1));
             return false;
         }
+        m_liveReadyBatches.remove(0);
+        ++m_liveSentBatches;
+        if ((m_liveSentBatches % 30) == 0) {
+            ui->plainTextEdit->appendPlainText(
+                        QString("[XDMA] Live stream progress: sent batches=%1")
+                        .arg(m_liveSentBatches));
+        }
     }
 
+    m_lastLiveSendMs = QDateTime::currentMSecsSinceEpoch();
     return true;
 }
 

@@ -1,112 +1,75 @@
 # camera_PC
 
-`camera_PC` 是一个基于 Qt 的摄像头采集与 XDMA 联调项目。核心目标是将摄像头原始视频流在 PC 侧先按协议封包，再按可配置批次稳定写入 FPGA，同时提供 user 通道 AXI-Lite 寄存器读写能力。
+`camera_PC` 是一个基于 Qt 的相机采集 + XDMA 发送工具，用于把相机原始视频流按固定协议封包后，批量写入 FPGA 侧 `h2c_0`，并提供 `user` 通道 AXI-Lite 寄存器读写能力。
 
-## 1. 项目思路
+## 1. 项目目标
 
-项目按四层拆分，避免业务流程和底层硬件细节耦合：
+- 在 PC 侧完成视频 payload 协议封包。
+- 以可配置批次（默认 1 MiB）聚合后一次写入 XDMA。
+- 在同一界面完成链路自检、协议自测与寄存器联调。
 
-1. 采集层（`cameraprobe.*`）
-- 枚举相机模式。
-- one-shot 单帧采集。
+## 2. 主要功能
 
-2. 协议层（`video_packet_batcher.*`）
-- 原始视频字节流切分为固定 `1024B` 协议包。
-- 包格式固定：`EB 90 | lengthH | lengthL | dest(6) | source(6) | priority(2) | payload(1006)`。
+- 相机模式枚举、单帧采集、实时预览。
+- 原始视频流封包为固定 `1024B` 协议包。
+- 协议包按批次聚合发送（批次大小可在 UI 调整）。
+- `user + h2c_0` 通道打开与 ready 状态自检。
+- XDMA 链路测试包发送。
+- 协议模块内存自测（不依赖硬件）。
+- AXI-Lite 寄存器读写（通过 `user` 通道）。
 
-3. 发送层（`widget.cpp`）
-- 协议包按批次聚合（默认 `1MiB`，可配置）。
-- 每个批次走 `h2c_0` 单次写入。
-
-4. 控制层（`widget.ui + widget.*`）
-- UI 按钮负责联调流程。
-- 运行时调参和 AXI-Lite 寄存器读写面板负责快速调试。
-
-## 2. 核心功能
-
-1. 摄像头模式枚举、单帧抓取、预览。
-2. 视频数据协议封包（1024B 固定包）。
-3. 批次聚合发送（默认 1MiB，可通过 UI 改写入大小）。
-4. XDMA 通道打开与 `ready_state` 自检。
-5. XDMA 链路测试包发送。
-6. 协议封包模块手动自测。
-7. AXI-Lite 寄存器读写（通过 user 通道）。
-
-## 3. 协议与发送规则
+## 3. 协议与批量发送
 
 ### 3.1 固定 1024B 协议包
 
-- 每 `1006B` 原始视频数据生成 1 包。
-- `lengthH/lengthL` 填写整包总长度（包头+payload），固定为 `0x0400`。
-- 最后一包不足 `1006B` 也会生成，剩余 payload 自动补零。
+协议包格式：
 
-### 3.2 批次聚合写入
+`EB 90 | lengthH | lengthL | dest(6) | source(6) | priority(2) | payload(1006)`
 
-- 协议包按“当前批次大小”累计后发送。
-- 默认批次 `1MiB`。
-- 批次大小由 UI 的 `写入大小(KB)` 控件控制。
-- 批次大小必须是 `1024B` 的整数倍，保证不打断协议包边界。
+规则：
 
-## 4. UI 功能分组
+- 每累计满 `1006B` 原始 payload 才生成 `1` 个协议包。
+- `length` 固定为 `0x0400`（1024）。
+- 不再在每次输入末尾强制补零收尾。
+- 不足 `1006B` 的尾部原始字节会缓存到下一次输入继续拼接。
 
-### 4.1 采集与视频发送
+### 3.2 批量聚合与节流
 
-- `列出模式`
-- `采一帧`
-- `发送缓存帧(封包+批量)`
-- `开始/停止实时视频发送(封包+批量)`
+- 协议包先聚合为“完整批次”，默认 `1 MiB`。
+- 批次大小由 UI 的 `写入大小(KB)` 控制，必须是 `1024B` 的整数倍。
+- 实时模式下“节流”只限制 XDMA 写入频率，不丢弃输入帧数据。
+- 已产出的完整批次会进入待发队列，在允许发送窗口内按“一批次一次 write”发送。
 
-### 4.2 XDMA 与测试
+## 4. 实时发送行为说明
 
-- `打开XDMA通道并自检`
-- `发送XDMA链路测试包`
-- `运行协议封包自测`
+- 开始实时发送：进入封包 + 批量发送流程。
+- 停止实时发送时会：
+- 统计并输出已发送批次数。
+- 清理未满 `1006B` 的 payload 尾部缓存（记为 `dropped-tail`）。
+- 输出当前未发缓存字节，便于联调排查。
 
-### 4.3 运行时调参
+## 5. 构建环境
 
-- `节流间隔(ms)`：控制实时发送最小间隔。
-- `写入大小(KB)`：控制视频主链路每次向 XDMA 写入的批次大小。
+- Qt：`core gui widgets multimedia multimediawidgets`
+- C++ 标准：`C++17`
+- 平台：Windows（`camera_PC.pro` 已配置 `driver/` 下 XDMA 库链接）
 
-### 4.4 AXI-Lite 寄存器读写（新增）
-
-- `寄存器地址`：支持 `0x..` 或十进制输入。
-- `写入值`：支持 `0x..` 或十进制输入。
-- `读寄存器`：读取 user 通道指定地址 32bit 值，显示在 `读回值`。
-- `写寄存器`：向 user 通道指定地址写入 32bit 值。
-
-约束：
-- 地址必须 4 字节对齐。
-- 输入范围是 `uint32`。
-- 若 user 通道未打开，会自动尝试执行 XDMA 打开与自检。
-
-## 5. 调用链
-
-### 5.1 视频发送链路
-
-`相机帧` -> `sendVideoPayloadWithBatching()` -> `VideoPacketBatcher::enqueueVideoPayload()` -> `sendXdmaPayload(..., forceSingleWrite=true)` -> `h2c_0`
-
-### 5.2 寄存器读链路
-
-`读寄存器按钮` -> `parseUiRegisterValue()` -> `readUserRegister()` -> `read_device(user, addr, 4, ...)`
-
-### 5.3 寄存器写链路
-
-`写寄存器按钮` -> `parseUiRegisterValue()` -> `writeUserRegister()` -> `write_device(user, addr, 4, ...)`
+建议使用 Qt Creator 打开 `camera_PC.pro` 构建运行。
 
 ## 6. 推荐联调流程
 
-1. 点 `打开XDMA通道并自检`，确认 user/h2c_0 就绪。
-2. 点 `发送XDMA链路测试包`，确认基础链路可写。
-3. 点 `运行协议封包自测`，确认封包与聚合逻辑。
-4. 设置 `写入大小(KB)`。
-5. 开始 `采一帧` + `发送缓存帧(封包+批量)`，或启动实时发送。
-6. 需要寄存器调试时，直接在 AXI-Lite 面板读写地址。
+1. 点击 `打开XDMA通道并自检`，确认 `user/h2c_0` 就绪。
+2. 点击 `发送XDMA链路测试包`，确认基础写通路可用。
+3. 点击 `运行协议封包自测`，确认封包逻辑正常。
+4. 设置 `写入大小(KB)` 与 `节流间隔(ms)`。
+5. 执行 `采一帧 + 发送缓存帧(封包+批量)`，或直接开启实时发送。
+6. 需要寄存器联调时，使用 AXI-Lite 面板读写目标地址。
 
-## 7. 日志速查
+## 7. 关键日志
 
 - `[OK] XDMA open complete: user + h2c_0 ready.`
 - `[CFG] XDMA write size set to ... KB`
-- `[PKG] ... raw=... packets=... emitted=... x ...KB, cached=...`
+- `[PKG] ... raw=... packets=... produced=... queued=... cached=... payload-tail=...`
 - `[SELFTEST] PASS ...`
 - `[AXIL] READ addr=... -> value=...`
 - `[AXIL] WRITE addr=... <- value=...`
@@ -114,15 +77,9 @@
 
 ## 8. 代码结构
 
-- `widget.h / widget.cpp`：主流程、UI、XDMA、寄存器读写。
-- `cameraprobe.h / cameraprobe.cpp`：相机枚举与单帧采集。
-- `video_packet_batcher.h / video_packet_batcher.cpp`：封包与批次聚合。
-- `widget.ui`：主界面布局。
-- `driver/`：XDMA 动态库与导入库。
-
-## 9. 备注
-
-- 默认路由字段在 `VideoPacketBatcher::defaultRouteFields()` 集中配置。
-- 寄存器读写走 user 通道，不经过 h2c_0 视频发送路径。
-
-0x15004 0x00101005
+- `widget.h / widget.cpp`：UI、主流程、XDMA、实时发送与寄存器读写。
+- `cameraprobe.h / cameraprobe.cpp`：相机模式枚举与帧采集。
+- `video_packet_batcher.h / video_packet_batcher.cpp`：协议封包与批量聚合。
+- `widget.ui`：界面布局。
+- `driver/`：XDMA 相关头文件与库。
+- `doc/寄存器列表.docx`：寄存器文档。

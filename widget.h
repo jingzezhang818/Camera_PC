@@ -12,6 +12,7 @@
 #include <QCameraViewfinder>
 #include <QVideoProbe>
 #include <QByteArray>
+#include <QVector>
 #include "cameraprobe.h"
 #include "video_packet_batcher.h"
 
@@ -72,7 +73,8 @@ private:
     // 原始视频流 -> 1024B 协议封包 -> 可配置批次聚合 -> sendXdmaPayload(single write)。
     bool sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                       const QString &label,
-                                      bool verbose = true);
+                                      bool verbose = true,
+                                      bool allowSendNow = true);
 
     // 软件自测入口（纯内存，不依赖 XDMA 设备），改为“手动触发”。
     void runPacketModuleSelfTest();
@@ -131,7 +133,8 @@ private:
     // 实时流发送状态（预览帧 -> h2c_0）。
     bool m_liveVideoSending = false;
     qint64 m_lastLiveSendMs = 0;
-    int m_liveSentFrames = 0;
+    int m_liveSentBatches = 0;
+    QVector<QByteArray> m_liveReadyBatches;
 
     // 发送调参：节流间隔和写入批次大小都支持界面实时调整。
     // m_liveStreamThrottleMs：控制最小发送间隔（毫秒）。
