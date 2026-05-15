@@ -81,6 +81,31 @@ private:
     QString m_deviceName;
 };
 
+// Continuous raw YUYV surface used by live preview/streaming.
+// It deliberately advertises only YUYV so Qt will not negotiate RGB32.
+class RawFrameSurface : public QAbstractVideoSurface
+{
+    Q_OBJECT
+public:
+    explicit RawFrameSurface(QObject *parent = nullptr);
+
+    void setExpectedMeta(const QString &desc, const QString &devName);
+
+    QList<QVideoFrame::PixelFormat> supportedPixelFormats(
+            QAbstractVideoBuffer::HandleType type = QAbstractVideoBuffer::NoHandle) const override;
+    bool present(const QVideoFrame &frame) override;
+
+signals:
+    void logMessage(const QString &msg);
+    void rawFrameAvailable(const CapturedFrame &frame);
+    void rawFrameFailed(const QString &reason);
+
+private:
+    QString m_cameraDescription;
+    QString m_deviceName;
+    bool m_loggedFirstFrame = false;
+};
+
 // 外部使用的抓帧控制器：管理 QCamera 与 FrameGrabSurface 生命周期。
 class CameraProbe : public QObject
 {

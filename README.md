@@ -11,6 +11,7 @@
 ## 2. 主要功能
 
 - 相机模式枚举、单帧采集、实时预览。
+- 实时预览链路强制使用 `640x360 + YUYV`（驱动不显式枚举时会主动请求并校验实际帧）。
 - 原始视频流封包为固定 `1024B` 协议包。
 - 协议包按批次聚合发送（批次大小可在 UI 调整）。
 - `user + h2c_0` 通道打开与 ready 状态自检。
@@ -43,6 +44,7 @@
 ## 4. 实时发送行为说明
 
 - 开始实时发送：进入封包 + 批量发送流程。
+- 实时发送前会检查 `640x360 YUYV` 预览是否可用，不满足则拒绝启动。
 - 停止实时发送时会统计并输出已发送批次数。
 - 停止实时发送时会清理未满 `1006B` 的 payload 尾部缓存（记为 `dropped-tail`）。
 - 停止实时发送时会输出当前未发缓存字节，便于联调排查。
@@ -69,6 +71,7 @@
 - `[OK] XDMA open complete: user + h2c_0 ready.`
 - `[CFG] XDMA write size set to ... KB`
 - `[PKG] ... raw=... packets=... produced=... queued=... cached=... payload-tail=...`
+- `[RAW] ...`（实时原始帧状态、stride 归一化等）
 - `[SELFTEST] PASS ...`
 - `[AXIL] READ addr=... -> value=...`
 - `[AXIL] WRITE addr=... <- value=...`

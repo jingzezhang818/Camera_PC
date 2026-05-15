@@ -116,6 +116,84 @@ bool FrameGrabSurface::present(const QVideoFrame &frame)
     return true;
 }
 
+// ===== Module: RawFrameSurface (continuous YUYV capture surface) =====
+RawFrameSurface::RawFrameSurface(QObject *parent)
+    : QAbstractVideoSurface(parent)
+{
+}
+
+void RawFrameSurface::setExpectedMeta(const QString &desc, const QString &devName)
+{
+    m_cameraDescription = desc;
+    m_deviceName = devName;
+}
+
+QList<QVideoFrame::PixelFormat> RawFrameSurface::supportedPixelFormats(
+        QAbstractVideoBuffer::HandleType type) const
+{
+    if (type != QAbstractVideoBuffer::NoHandle) {
+        return QList<QVideoFrame::PixelFormat>();
+    }
+
+    return QList<QVideoFrame::PixelFormat>() << QVideoFrame::Format_YUYV;
+}
+
+bool RawFrameSurface::present(const QVideoFrame &frame)
+{
+    if (!frame.isValid()) {
+        emit logMessage(QStringLiteral("Invalid raw video frame received. Ignored."));
+        return true;
+    }
+
+    QVideoFrame copy(frame);
+    if (!copy.map(QAbstractVideoBuffer::ReadOnly)) {
+        emit rawFrameFailed(QStringLiteral("QVideoFrame::map(ReadOnly) failed for raw live frame."));
+        return false;
+    }
+
+    CapturedFrame out;
+    out.cameraDescription = m_cameraDescription;
+    out.cameraDeviceName = m_deviceName;
+    out.resolution = QSize(copy.width(), copy.height());
+    out.pixelFormat = copy.pixelFormat();
+    out.startTimeUs = copy.startTime();
+    out.planeCount = copy.planeCount();
+
+    const int loopPlaneCount = out.planeCount > 0 ? out.planeCount : 1;
+    const int mappedBytesTotal = copy.mappedBytes();
+    for (int p = 0; p < loopPlaneCount; ++p) {
+        out.bytesPerLines.push_back(copy.bytesPerLine(p));
+        out.mappedBytesPerPlane.push_back(p == 0 ? mappedBytesTotal : -1);
+    }
+
+    const uchar *bits = copy.bits();
+    if (mappedBytesTotal > 0 && bits) {
+        out.payload.append(reinterpret_cast<const char *>(bits), mappedBytesTotal);
+    }
+
+    copy.unmap();
+
+    if (out.payload.isEmpty()) {
+        emit rawFrameFailed(QStringLiteral("Raw live frame arrived, but payload is empty."));
+        return false;
+    }
+
+    if (!m_loggedFirstFrame) {
+        const int bytesPerLine = out.bytesPerLines.isEmpty() ? -1 : out.bytesPerLines.first();
+        emit logMessage(QStringLiteral("Raw frame received: actualFormat=%1, size=%2x%3, planes=%4, bytesPerLine=%5, raw=%6B")
+                        .arg(CameraProbe::pixelFormatToString(out.pixelFormat))
+                        .arg(out.resolution.width())
+                        .arg(out.resolution.height())
+                        .arg(out.planeCount)
+                        .arg(bytesPerLine)
+                        .arg(out.payload.size()));
+        m_loggedFirstFrame = true;
+    }
+
+    emit rawFrameAvailable(out);
+    return true;
+}
+
 // ===== 模块：CameraProbe（外部抓拍控制器）=====
 // 说明：先给出模式查询静态接口，再给出会话生命周期和回调处理。
 

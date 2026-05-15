@@ -9,8 +9,6 @@
 
 #include <QWidget>
 #include <QCamera>
-#include <QCameraViewfinder>
-#include <QVideoProbe>
 #include <QByteArray>
 #include <QVector>
 #include "cameraprobe.h"
@@ -18,6 +16,7 @@
 
 class QSpinBox;
 class QLineEdit;
+class QLabel;
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class Widget; }
@@ -51,11 +50,11 @@ private slots:
 
     // ===== 回调槽：预览链路 =====
     void onPreviewCameraError(QCamera::Error error);
-    void onPreviewFrameProbed(const QVideoFrame &frame);
+    void onRawFrameAvailable(const CapturedFrame &frame);
 
 private:
     // ===== 模块：生命周期与预览初始化 =====
-    // 初始化实时预览（QCameraViewfinder + QVideoProbe）。
+    // 初始化实时 raw YUYV 预览。
     void initializePreview();
 
     // 初始化“节流间隔/写入大小”调参控件，并绑定运行时参数。
@@ -67,6 +66,11 @@ private:
     // 启动/停止实时预览相机。
     void startPreview();
     void stopPreview();
+    bool findStrictLiveYuyvMode(CameraModeInfo &outMode, QString *report) const;
+    bool normalizeLiveYuyvFrame(const CapturedFrame &frame,
+                                QByteArray &payload,
+                                QString *reason) const;
+    void updateRawPreview(const CapturedFrame &frame);
 
     // ===== 模块：视频业务发送（封包 + 聚合） =====
     // 视频发送专用入口：
@@ -119,8 +123,8 @@ private:
 
     // 实时预览链路对象。
     QCamera *m_previewCamera = nullptr;
-    QCameraViewfinder *m_viewfinder = nullptr;
-    QVideoProbe *m_videoProbe = nullptr;
+    QLabel *m_previewLabel = nullptr;
+    RawFrameSurface *m_rawFrameSurface = nullptr;
 
     // 抓取单帧前会暂停预览，抓取结束后根据该标记恢复。
     bool m_restartPreviewAfterCapture = false;
@@ -132,6 +136,7 @@ private:
 
     // 实时流发送状态（预览帧 -> h2c_0）。
     bool m_liveVideoSending = false;
+    qint64 m_liveSendStartMs = 0;
     qint64 m_lastLiveSendMs = 0;
     int m_liveSentBatches = 0;
     QVector<QByteArray> m_liveReadyBatches;

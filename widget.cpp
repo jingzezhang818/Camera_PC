@@ -5,11 +5,14 @@
 #include <QFileInfo>
 #include <QDateTime>
 #include <QRegularExpression>
+#include <QStringList>
 #include <QImage>
+#include <QPixmap>
 #include <QTimer>
 #include <QDebug>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QFrame>
 #include <QSpinBox>
 #include <QLineEdit>
 #include <QPushButton>
@@ -21,6 +24,12 @@
 #include "xdmaDLL_public.h"
 
 namespace {
+
+constexpr int kLiveRawWidth = 640;
+constexpr int kLiveRawHeight = 360;
+constexpr int kLiveRawBytesPerPixel = 2;
+constexpr int kLiveRawLineBytes = kLiveRawWidth * kLiveRawBytesPerPixel;
+constexpr int kLiveRawFrameBytes = kLiveRawLineBytes * kLiveRawHeight;
 
 // 句柄有效性判断：统一过滤空句柄与 INVALID_HANDLE_VALUE。
 bool isValidHandle(HANDLE handle)
@@ -144,17 +153,16 @@ Widget::~Widget()
 // 初始化实时预览：创建 Viewfinder、插入布局、挂接 VideoProbe。
 void Widget::initializePreview()
 {
-    m_viewfinder = new QCameraViewfinder(this);
-    m_viewfinder->setObjectName("cameraPreview");
-    m_viewfinder->setMinimumHeight(280);
+    m_previewLabel = new QLabel(this);
+    m_previewLabel->setObjectName("cameraPreview");
+    m_previewLabel->setMinimumHeight(280);
+    m_previewLabel->setAlignment(Qt::AlignCenter);
+    m_previewLabel->setFrameShape(QFrame::StyledPanel);
+    m_previewLabel->setText(QStringLiteral("Waiting for 640x360 YUYV camera preview..."));
 
-    ui->verticalLayout->insertWidget(1, m_viewfinder, 1);
+    ui->verticalLayout->insertWidget(1, m_previewLabel, 1);
     initializeTransferControls();
     initializeAxiLiteControls();
-
-    m_videoProbe = new QVideoProbe(this);
-    connect(m_videoProbe, &QVideoProbe::videoFrameProbed,
-            this, &Widget::onPreviewFrameProbed);
 
     startPreview();
 }
@@ -174,8 +182,8 @@ void Widget::initializeTransferControls()
     QLabel *throttleLabel = new QLabel(
                 QString::fromWCharArray(L"\u8282\u6D41\u95F4\u9694(ms):"), panel);
     m_throttleSpin = new QSpinBox(panel);
-    m_throttleSpin->setRange(5, 1000);
-    m_throttleSpin->setSingleStep(5);
+    m_throttleSpin->setRange(1, 1000);
+    m_throttleSpin->setSingleStep(1);
     m_throttleSpin->setValue(static_cast<int>(m_liveStreamThrottleMs));
 
     QLabel *chunkLabel = new QLabel(
@@ -345,7 +353,7 @@ void Widget::initializeAxiLiteControls()
 // 若已有活动预览则直接返回，避免重复创建相机对象。
 void Widget::startPreview()
 {
-    if (!m_viewfinder) {
+    if (!m_previewLabel) {
         return;
     }
 
@@ -353,45 +361,60 @@ void Widget::startPreview()
         return;
     }
 
-    const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
-    if (cameras.isEmpty()) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Live preview is unavailable because no camera was found."));
+    CameraModeInfo selected;
+    QString report;
+    if (!findStrictLiveYuyvMode(selected, &report)) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Live raw preview requires exact 640x360 YUYV. ") + report);
+        m_previewLabel->setText(QStringLiteral("No exact 640x360 YUYV camera mode."));
         return;
     }
-
-    const QCameraInfo info = cameras.first();
-
-    qInfo().noquote() << QString("[CAMERA] selected preview device: desc=%1, dev=%2")
-                         .arg(info.description())
-                         .arg(info.deviceName());
+    if (!report.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + report);
+    }
 
     if (m_previewCamera) {
         m_previewCamera->stop();
         m_previewCamera->deleteLater();
         m_previewCamera = nullptr;
     }
-
-    m_previewCamera = new QCamera(info, this);
-    m_previewCamera->setCaptureMode(QCamera::CaptureViewfinder);
-    m_previewCamera->setViewfinder(m_viewfinder);
-
-    if (m_videoProbe) {
-        if (!m_videoProbe->setSource(m_previewCamera)) {
-            ui->plainTextEdit->appendPlainText(
-                        QStringLiteral("[WARN] Video probe attach failed. Live XDMA streaming may be unavailable."));
-        }
+    if (m_rawFrameSurface) {
+        m_rawFrameSurface->deleteLater();
+        m_rawFrameSurface = nullptr;
     }
+
+    m_rawFrameSurface = new RawFrameSurface(this);
+    m_rawFrameSurface->setExpectedMeta(selected.description, selected.deviceName);
+    connect(m_rawFrameSurface, &RawFrameSurface::logMessage,
+            this, [this](const QString &msg) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[RAW] ") + msg);
+    });
+    connect(m_rawFrameSurface, &RawFrameSurface::rawFrameFailed,
+            this, [this](const QString &reason) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] ") + reason);
+    });
+    connect(m_rawFrameSurface, &RawFrameSurface::rawFrameAvailable,
+            this, &Widget::onRawFrameAvailable);
+
+    m_previewCamera = new QCamera(selected.cameraInfo, this);
+    m_previewCamera->setCaptureMode(QCamera::CaptureViewfinder);
+    m_previewCamera->setViewfinder(m_rawFrameSurface);
+    m_previewCamera->setViewfinderSettings(selected.settings);
 
     connect(m_previewCamera, SIGNAL(error(QCamera::Error)),
             this, SLOT(onPreviewCameraError(QCamera::Error)));
 
     m_previewCamera->start();
     ui->plainTextEdit->appendPlainText(
-                QString("[INFO] Live preview started: %1")
-                .arg(info.description()));
+                QString("[INFO] Live raw preview requested: camera=%1, dev=%2, resolution=%3x%4, format=%5, fps=[%6,%7]")
+                .arg(selected.description)
+                .arg(selected.deviceName)
+                .arg(selected.settings.resolution().width())
+                .arg(selected.settings.resolution().height())
+                .arg(CameraProbe::pixelFormatToString(selected.settings.pixelFormat()))
+                .arg(selected.settings.minimumFrameRate())
+                .arg(selected.settings.maximumFrameRate()));
 
     QTimer::singleShot(300, this, [this]() {
-        // 延迟读取 viewfinderSettings，可提高拿到有效默认参数的概率。
         if (!m_previewCamera) {
             return;
         }
@@ -404,12 +427,12 @@ void Widget::startPreview()
 
         if (!hasResolution && !hasFormat && !hasFrameRate) {
             ui->plainTextEdit->appendPlainText(
-                        QStringLiteral("[INFO] Preview default params: driver does not expose explicit default viewfinder settings."));
+                        QStringLiteral("[INFO] Live raw camera params are not exposed by the driver."));
             return;
         }
 
         ui->plainTextEdit->appendPlainText(
-                    QString("[INFO] Preview default params: resolution=%1x%2, format=%3, fps=[%4,%5]")
+                    QString("[INFO] Live raw camera params: resolution=%1x%2, format=%3, fps=[%4,%5]")
                     .arg(s.resolution().width())
                     .arg(s.resolution().height())
                     .arg(CameraProbe::pixelFormatToString(s.pixelFormat()))
@@ -418,16 +441,181 @@ void Widget::startPreview()
     });
 }
 
-// 停止并释放预览相机。
 void Widget::stopPreview()
 {
-    if (!m_previewCamera) {
+    if (m_previewCamera) {
+        m_previewCamera->stop();
+        m_previewCamera->deleteLater();
+        m_previewCamera = nullptr;
+    }
+
+    if (m_rawFrameSurface) {
+        m_rawFrameSurface->deleteLater();
+        m_rawFrameSurface = nullptr;
+    }
+}
+
+bool Widget::findStrictLiveYuyvMode(CameraModeInfo &outMode, QString *report) const
+{
+    const QList<CameraModeInfo> modes = CameraProbe::enumerateYuy2Modes();
+    QStringList available;
+
+    for (const CameraModeInfo &mode : modes) {
+        const QSize resolution = mode.settings.resolution();
+        available << QString("%1 dev=%2 %3x%4 fps=[%5,%6]")
+                     .arg(mode.description)
+                     .arg(mode.deviceName)
+                     .arg(resolution.width())
+                     .arg(resolution.height())
+                     .arg(mode.settings.minimumFrameRate())
+                     .arg(mode.settings.maximumFrameRate());
+
+        if (resolution == QSize(kLiveRawWidth, kLiveRawHeight) &&
+            mode.settings.pixelFormat() == QVideoFrame::Format_YUYV) {
+            outMode = mode;
+            if (report) {
+                *report = QStringLiteral("Exact 640x360 YUYV mode found.");
+            }
+            return true;
+        }
+    }
+
+    const QList<CameraModeInfo> allModes = CameraProbe::enumerateAllModes();
+    bool hasExplicitMode = false;
+    for (const CameraModeInfo &mode : allModes) {
+        const QSize resolution = mode.settings.resolution();
+        if (resolution.width() > 0 ||
+            resolution.height() > 0 ||
+            mode.settings.pixelFormat() != QVideoFrame::Format_Invalid ||
+            mode.settings.minimumFrameRate() > 0.0 ||
+            mode.settings.maximumFrameRate() > 0.0) {
+            hasExplicitMode = true;
+            break;
+        }
+    }
+
+    if (modes.isEmpty() && !hasExplicitMode) {
+        const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
+        if (!cameras.isEmpty()) {
+            const QCameraInfo info = cameras.first();
+            QCameraViewfinderSettings requested;
+            requested.setResolution(QSize(kLiveRawWidth, kLiveRawHeight));
+            requested.setPixelFormat(QVideoFrame::Format_YUYV);
+
+            outMode.cameraIndex = 0;
+            outMode.cameraInfo = info;
+            outMode.description = info.description();
+            outMode.deviceName = info.deviceName();
+            outMode.settings = requested;
+
+            if (report) {
+                *report = QStringLiteral("Camera driver did not expose a mode list; requesting 640x360 YUYV and validating actual frames.");
+            }
+            return true;
+        }
+    }
+
+    if (report) {
+        if (available.isEmpty()) {
+            *report = QStringLiteral("No YUYV modes were reported by the camera driver.");
+        } else {
+            *report = QStringLiteral("Available YUYV modes: ") + available.join(QStringLiteral(" | "));
+        }
+    }
+
+    return false;
+}
+
+bool Widget::normalizeLiveYuyvFrame(const CapturedFrame &frame,
+                                    QByteArray &payload,
+                                    QString *reason) const
+{
+    payload.clear();
+
+    if (frame.pixelFormat != QVideoFrame::Format_YUYV) {
+        if (reason) {
+            *reason = QString("actualFormat=%1, expected=YUYV")
+                    .arg(CameraProbe::pixelFormatToString(frame.pixelFormat));
+        }
+        return false;
+    }
+
+    if (frame.resolution != QSize(kLiveRawWidth, kLiveRawHeight)) {
+        if (reason) {
+            *reason = QString("actualSize=%1x%2, expected=%3x%4")
+                    .arg(frame.resolution.width())
+                    .arg(frame.resolution.height())
+                    .arg(kLiveRawWidth)
+                    .arg(kLiveRawHeight);
+        }
+        return false;
+    }
+
+    const int bytesPerLine = (!frame.bytesPerLines.isEmpty() && frame.bytesPerLines.first() > 0)
+            ? frame.bytesPerLines.first()
+            : kLiveRawLineBytes;
+
+    if (bytesPerLine < kLiveRawLineBytes) {
+        if (reason) {
+            *reason = QString("bytesPerLine=%1, expected at least %2")
+                    .arg(bytesPerLine)
+                    .arg(kLiveRawLineBytes);
+        }
+        return false;
+    }
+
+    const int requiredMappedBytes = bytesPerLine * kLiveRawHeight;
+    if (frame.payload.size() < requiredMappedBytes) {
+        if (reason) {
+            *reason = QString("payload=%1B, required=%2B")
+                    .arg(frame.payload.size())
+                    .arg(requiredMappedBytes);
+        }
+        return false;
+    }
+
+    if (bytesPerLine == kLiveRawLineBytes) {
+        payload = frame.payload.left(kLiveRawFrameBytes);
+        return payload.size() == kLiveRawFrameBytes;
+    }
+
+    payload.resize(kLiveRawFrameBytes);
+    const char *src = frame.payload.constData();
+    char *dst = payload.data();
+    for (int y = 0; y < kLiveRawHeight; ++y) {
+        std::memcpy(dst + y * kLiveRawLineBytes,
+                    src + y * bytesPerLine,
+                    kLiveRawLineBytes);
+    }
+
+    ui->plainTextEdit->appendPlainText(
+                QString("[RAW] Normalized stride frame: bytesPerLine=%1 -> payload=%2B")
+                .arg(bytesPerLine)
+                .arg(payload.size()));
+    return true;
+}
+
+void Widget::updateRawPreview(const CapturedFrame &frame)
+{
+    if (!m_previewLabel) {
+        return;
+    }
+    if (frame.pixelFormat != QVideoFrame::Format_YUYV) {
         return;
     }
 
-    m_previewCamera->stop();
-    m_previewCamera->deleteLater();
-    m_previewCamera = nullptr;
+    QImage image;
+    if (!yuyvToRgbImage(frame, image)) {
+        return;
+    }
+
+    const QSize target = m_previewLabel->size();
+    const QPixmap pixmap = QPixmap::fromImage(image);
+    if (target.width() > 0 && target.height() > 0) {
+        m_previewLabel->setPixmap(pixmap.scaled(target, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    } else {
+        m_previewLabel->setPixmap(pixmap);
+    }
 }
 
 // ===== 模块：UI 操作入口（按钮槽）与采集回调 =====
@@ -620,13 +808,23 @@ void Widget::on_btnSendCapturedFrame_clicked()
 }
 
 // 实时发送开关按钮。
-// 开启后由 onPreviewFrameProbed 持续处理帧并发送；关闭后仅保留预览不发送。
+// 开启后由 onRawFrameAvailable 按节流间隔采样并发送；关闭后仅保留预览不发送。
 void Widget::on_btnSendLiveVideo_clicked()
 {
-    // 运行时开关路径：预览帧 -> QVideoProbe -> sendVideoPayloadWithBatching -> h2c_0。
+    // 运行时开关路径：RawFrameSurface -> YUYV normalize -> sendVideoPayloadWithBatching -> h2c_0。
     // 这里只切换“是否发送”，不改变相机采集参数。
     if (!m_liveVideoSending) {
+        if (!m_previewCamera || m_previewCamera->state() != QCamera::ActiveState) {
+            startPreview();
+        }
+        if (!m_previewCamera) {
+            ui->plainTextEdit->appendPlainText(
+                        QStringLiteral("[ERROR] Cannot start live streaming: exact 640x360 YUYV preview is not active."));
+            return;
+        }
+
         m_liveVideoSending = true;
+        m_liveSendStartMs = QDateTime::currentMSecsSinceEpoch();
         m_lastLiveSendMs = 0;
         m_liveSentBatches = 0;
         m_liveReadyBatches.clear();
@@ -643,10 +841,16 @@ void Widget::on_btnSendLiveVideo_clicked()
         queuedBatchBytes += batch.size();
     }
 
+    const qint64 elapsedMs = m_liveSendStartMs > 0
+            ? qMax<qint64>(0, QDateTime::currentMSecsSinceEpoch() - m_liveSendStartMs)
+            : 0;
+
     m_liveVideoSending = false;
+    m_liveSendStartMs = 0;
     ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
     ui->plainTextEdit->appendPlainText(
-                QString("[XDMA] Live camera streaming stopped. sent batches=%1, cached-not-sent=%2 bytes, dropped-tail=%3 bytes")
+                QString("[XDMA] Live camera streaming stopped. duration=%1 ms, sent batches=%2, cached-not-sent=%3 bytes, dropped-tail=%4 bytes")
+                .arg(elapsedMs)
                 .arg(m_liveSentBatches)
                 .arg(m_videoPacketBatcher.pendingBytes() + queuedBatchBytes)
                 .arg(droppedPayloadBytes));
@@ -805,71 +1009,51 @@ void Widget::onPreviewCameraError(QCamera::Error error)
     ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Live preview error: ") + msg);
 }
 
-// 预览帧回调（实时发送主链路）：
-// 1) 根据开关和节流条件决定是否发送；
-// 2) map 帧并拷贝原始字节；
-// 3) 调用 sendVideoPayloadWithBatching 完成“封包+聚合+发送”；
-// 4) 错误时自动停流并回退 UI 状态。
-void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
+// Raw YUYV 帧回调：
+// 1) 同一份原始帧转 RGB 更新预览；
+// 2) 节流窗口到达时才采当前帧发送；
+// 3) 发送前规范化为连续 640x360 YUYV(460800B)。
+void Widget::onRawFrameAvailable(const CapturedFrame &frame)
 {
+    updateRawPreview(frame);
+
     if (!m_liveVideoSending) {
         return;
     }
 
-    // 节流控制“采样频率”：仅在时间窗到达时采一帧参与发送。
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     if (m_lastLiveSendMs > 0 && (nowMs - m_lastLiveSendMs) < m_liveStreamThrottleMs) {
         return;
     }
 
-    if (!frame.isValid()) {
-        return;
-    }
-
-    // 将视频帧映射到 CPU 可访问内存，再拷贝到 QByteArray。
-    // 负载数据的布局由驱动给出的像素格式与 stride 决定。
-    QVideoFrame copy(frame);
-    if (!copy.map(QAbstractVideoBuffer::ReadOnly)) {
-        return;
-    }
-
-    const int bytes = copy.mappedBytes();
-    const uchar *bits = copy.bits();
-    const int width = copy.width();
-    const int height = copy.height();
-    const QVideoFrame::PixelFormat fmt = copy.pixelFormat();
-
     QByteArray payload;
-    if (bytes > 0 && bits) {
-        payload.append(reinterpret_cast<const char *>(bits), bytes);
-    }
-
-    copy.unmap();
-
-    if (payload.isEmpty()) {
+    QString reason;
+    if (!normalizeLiveYuyvFrame(frame, payload, &reason)) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Drop raw live frame: ") + reason);
         return;
     }
 
     m_lastLiveSendMs = nowMs;
     const bool ok = sendVideoPayloadWithBatching(payload,
-                                                 QString("live frame %1x%2 %3")
-                                                 .arg(width)
-                                                 .arg(height)
-                                                 .arg(CameraProbe::pixelFormatToString(fmt)),
+                                                 QString("live raw YUYV %1x%2")
+                                                 .arg(kLiveRawWidth)
+                                                 .arg(kLiveRawHeight),
                                                  false,
                                                  true);
 
     if (!ok) {
-        // 发送失败即停流，避免持续错误刷屏和驱动压力累积。
+        const qint64 elapsedMs = m_liveSendStartMs > 0
+                ? qMax<qint64>(0, QDateTime::currentMSecsSinceEpoch() - m_liveSendStartMs)
+                : 0;
         m_liveVideoSending = false;
+        m_liveSendStartMs = 0;
         ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
         ui->plainTextEdit->appendPlainText(
-                    QStringLiteral("[ERROR] Live camera streaming stopped due to XDMA write failure."));
+                    QString("[ERROR] Live raw YUYV streaming stopped due to XDMA write failure. duration=%1 ms")
+                    .arg(elapsedMs));
         return;
     }
-
 }
-
 // ===== 模块：传输与 XDMA 底层实现 =====
 // 说明：
 // 1) 该模块只承载“通道管理 + 发送执行 + 自测执行”；
