@@ -629,6 +629,7 @@ void Widget::on_btnSendLiveVideo_clicked()
         m_liveVideoSending = true;
         m_lastLiveSendMs = 0;
         m_liveSentBatches = 0;
+        m_liveReadyBatches.clear();
         ui->btnSendLiveVideo->setText(QString::fromUtf8("停止实时视频发送(封包+批量)"));
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[XDMA] Live camera streaming to h2c_0 started."));
@@ -649,6 +650,7 @@ void Widget::on_btnSendLiveVideo_clicked()
                 .arg(m_liveSentBatches)
                 .arg(m_videoPacketBatcher.pendingBytes() + queuedBatchBytes)
                 .arg(droppedPayloadBytes));
+    m_liveReadyBatches.clear();
 }
 
 // ----- 子模块：XDMA 与测试按钮 -----
@@ -814,6 +816,12 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         return;
     }
 
+    // 节流控制“采样频率”：仅在时间窗到达时采一帧参与发送。
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (m_lastLiveSendMs > 0 && (nowMs - m_lastLiveSendMs) < m_liveStreamThrottleMs) {
+        return;
+    }
+
     if (!frame.isValid()) {
         return;
     }
@@ -842,17 +850,14 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         return;
     }
 
-    // 发送节流仅限制“写 XDMA”频率，输入流数据不丢弃。
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    const bool allowSendNow =
-            (m_lastLiveSendMs <= 0) || ((nowMs - m_lastLiveSendMs) >= m_liveStreamThrottleMs);
+    m_lastLiveSendMs = nowMs;
     const bool ok = sendVideoPayloadWithBatching(payload,
                                                  QString("live frame %1x%2 %3")
                                                  .arg(width)
                                                  .arg(height)
                                                  .arg(CameraProbe::pixelFormatToString(fmt)),
                                                  false,
-                                                 allowSendNow);
+                                                 true);
 
     if (!ok) {
         // 发送失败即停流，避免持续错误刷屏和驱动压力累积。
