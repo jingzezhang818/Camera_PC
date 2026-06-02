@@ -2,6 +2,140 @@
 
 #include <QDebug>
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <dshow.h>
+#endif
+
+namespace {
+
+#ifdef Q_OS_WIN
+struct VideoInfoHeader2Compat
+{
+    RECT rcSource;
+    RECT rcTarget;
+    DWORD dwBitRate;
+    DWORD dwBitErrorRate;
+    REFERENCE_TIME AvgTimePerFrame;
+    DWORD dwInterlaceFlags;
+    DWORD dwCopyProtectFlags;
+    DWORD dwPictAspectRatioX;
+    DWORD dwPictAspectRatioY;
+    DWORD dwControlFlags;
+    DWORD dwReserved2;
+    BITMAPINFOHEADER bmiHeader;
+};
+
+QString guidToQString(const GUID &guid)
+{
+    wchar_t buffer[64] = {0};
+    if (StringFromGUID2(guid, buffer, 64) <= 0) {
+        return QStringLiteral("{GUID}");
+    }
+    return QString::fromWCharArray(buffer);
+}
+
+QString fourccFromSubtype(const GUID &subtype)
+{
+    const bool isFourccGuid =
+            subtype.Data2 == 0x0000 &&
+            subtype.Data3 == 0x0010 &&
+            subtype.Data4[0] == 0x80 &&
+            subtype.Data4[1] == 0x00 &&
+            subtype.Data4[2] == 0x00 &&
+            subtype.Data4[3] == 0xAA &&
+            subtype.Data4[4] == 0x00 &&
+            subtype.Data4[5] == 0x38 &&
+            subtype.Data4[6] == 0x9B &&
+            subtype.Data4[7] == 0x71;
+    if (!isFourccGuid) {
+        return QString();
+    }
+
+    const quint32 value = subtype.Data1;
+    const char chars[5] = {
+        static_cast<char>(value & 0xFF),
+        static_cast<char>((value >> 8) & 0xFF),
+        static_cast<char>((value >> 16) & 0xFF),
+        static_cast<char>((value >> 24) & 0xFF),
+        '\0'
+    };
+
+    bool printable = true;
+    for (int i = 0; i < 4; ++i) {
+        const unsigned char c = static_cast<unsigned char>(chars[i]);
+        if (c < 32 || c > 126) {
+            printable = false;
+            break;
+        }
+    }
+    return printable ? QString::fromLatin1(chars, 4) : QString();
+}
+
+QString subtypeToLabel(const GUID &subtype)
+{
+    if (subtype == MEDIASUBTYPE_YUY2) return QStringLiteral("YUY2");
+    if (subtype == MEDIASUBTYPE_UYVY) return QStringLiteral("UYVY");
+    if (subtype == MEDIASUBTYPE_NV12) return QStringLiteral("NV12");
+    if (subtype == MEDIASUBTYPE_YV12) return QStringLiteral("YV12");
+    if (subtype == MEDIASUBTYPE_MJPG) return QStringLiteral("MJPG");
+    if (subtype == MEDIASUBTYPE_RGB24) return QStringLiteral("RGB24");
+    if (subtype == MEDIASUBTYPE_RGB32) return QStringLiteral("RGB32");
+    if (subtype == MEDIASUBTYPE_ARGB32) return QStringLiteral("ARGB32");
+
+    const QString fourcc = fourccFromSubtype(subtype);
+    if (!fourcc.isEmpty()) {
+        return fourcc;
+    }
+    return guidToQString(subtype);
+}
+
+double fpsFromAvgTimePerFrame(LONGLONG avgTimePerFrame)
+{
+    return avgTimePerFrame > 0
+            ? (10000000.0 / static_cast<double>(avgTimePerFrame))
+            : 0.0;
+}
+
+void freeMediaType(AM_MEDIA_TYPE *mediaType)
+{
+    if (!mediaType) {
+        return;
+    }
+    if (mediaType->cbFormat != 0 && mediaType->pbFormat != nullptr) {
+        CoTaskMemFree(mediaType->pbFormat);
+        mediaType->cbFormat = 0;
+        mediaType->pbFormat = nullptr;
+    }
+    if (mediaType->pUnk != nullptr) {
+        mediaType->pUnk->Release();
+        mediaType->pUnk = nullptr;
+    }
+    CoTaskMemFree(mediaType);
+}
+
+QString readPropertyBagString(IPropertyBag *bag, const wchar_t *propertyName)
+{
+    if (!bag || !propertyName) {
+        return QString();
+    }
+
+    VARIANT variant;
+    VariantInit(&variant);
+    const HRESULT hr = bag->Read(propertyName, &variant, nullptr);
+    if (FAILED(hr) || variant.vt != VT_BSTR || variant.bstrVal == nullptr) {
+        VariantClear(&variant);
+        return QString();
+    }
+
+    const QString out = QString::fromWCharArray(variant.bstrVal);
+    VariantClear(&variant);
+    return out;
+}
+#endif
+
+} // namespace
+
 
 // ===== 模块：FrameGrabSurface（首帧采样 Surface）=====
 // 说明：负责 one-shot 首帧抓取，避免持续采样造成重复回调。
@@ -135,7 +269,9 @@ QList<QVideoFrame::PixelFormat> RawFrameSurface::supportedPixelFormats(
         return QList<QVideoFrame::PixelFormat>();
     }
 
-    return QList<QVideoFrame::PixelFormat>() << QVideoFrame::Format_YUYV;
+    return QList<QVideoFrame::PixelFormat>()
+            << QVideoFrame::Format_YUYV
+            << QVideoFrame::Format_Jpeg;
 }
 
 bool RawFrameSurface::present(const QVideoFrame &frame)
@@ -219,6 +355,227 @@ QString CameraProbe::pixelFormatToString(QVideoFrame::PixelFormat fmt)
     default:
         return QString("Other(%1)").arg(static_cast<int>(fmt));
     }
+}
+
+bool CameraProbe::enumerateAllModesViaDirectShow(QStringList &lines, QString *reason)
+{
+    lines.clear();
+
+#ifndef Q_OS_WIN
+    if (reason) {
+        *reason = QStringLiteral("DirectShow enumeration is only available on Windows.");
+    }
+    return false;
+#else
+    HRESULT hrCoInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool shouldCoUninit = SUCCEEDED(hrCoInit) || hrCoInit == S_FALSE;
+    if (FAILED(hrCoInit) && hrCoInit != RPC_E_CHANGED_MODE) {
+        if (reason) {
+            *reason = QStringLiteral("CoInitializeEx failed: 0x%1")
+                    .arg(static_cast<qulonglong>(hrCoInit), 8, 16, QLatin1Char('0'));
+        }
+        return false;
+    }
+
+    ICreateDevEnum *devEnum = nullptr;
+    IEnumMoniker *enumMoniker = nullptr;
+    const HRESULT hrDevEnum = CoCreateInstance(CLSID_SystemDeviceEnum,
+                                               nullptr,
+                                               CLSCTX_INPROC_SERVER,
+                                               IID_ICreateDevEnum,
+                                               reinterpret_cast<void **>(&devEnum));
+    if (FAILED(hrDevEnum) || !devEnum) {
+        if (reason) {
+            *reason = QStringLiteral("CreateDevEnum failed: 0x%1")
+                    .arg(static_cast<qulonglong>(hrDevEnum), 8, 16, QLatin1Char('0'));
+        }
+        if (devEnum) {
+            devEnum->Release();
+        }
+        if (shouldCoUninit) {
+            CoUninitialize();
+        }
+        return false;
+    }
+
+    const HRESULT hrClassEnum = devEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory,
+                                                                &enumMoniker,
+                                                                0);
+    if (hrClassEnum != S_OK || !enumMoniker) {
+        if (reason) {
+            *reason = QStringLiteral("No DirectShow video input device was found.");
+        }
+        devEnum->Release();
+        if (shouldCoUninit) {
+            CoUninitialize();
+        }
+        return false;
+    }
+
+    int cameraIndex = -1;
+    int modeCount = 0;
+    ULONG fetched = 0;
+    IMoniker *moniker = nullptr;
+
+    while (enumMoniker->Next(1, &moniker, &fetched) == S_OK) {
+        ++cameraIndex;
+
+        QString friendlyName = QStringLiteral("Unknown Camera");
+        QString devicePath = QString();
+
+        IPropertyBag *propertyBag = nullptr;
+        if (SUCCEEDED(moniker->BindToStorage(nullptr,
+                                             nullptr,
+                                             IID_IPropertyBag,
+                                             reinterpret_cast<void **>(&propertyBag))) &&
+                propertyBag) {
+            const QString readFriendly = readPropertyBagString(propertyBag, L"FriendlyName");
+            const QString readPath = readPropertyBagString(propertyBag, L"DevicePath");
+            if (!readFriendly.isEmpty()) {
+                friendlyName = readFriendly;
+            }
+            if (!readPath.isEmpty()) {
+                devicePath = readPath;
+            }
+            propertyBag->Release();
+            propertyBag = nullptr;
+        }
+
+        IBaseFilter *baseFilter = nullptr;
+        const HRESULT hrFilter = moniker->BindToObject(nullptr,
+                                                       nullptr,
+                                                       IID_IBaseFilter,
+                                                       reinterpret_cast<void **>(&baseFilter));
+        if (FAILED(hrFilter) || !baseFilter) {
+            moniker->Release();
+            moniker = nullptr;
+            continue;
+        }
+
+        lines << QString("[CAMERA] #%1 %2")
+                 .arg(cameraIndex)
+                 .arg(friendlyName);
+        if (!devicePath.isEmpty()) {
+            lines << QString("  devicePath: %1").arg(devicePath);
+        }
+
+        IEnumPins *enumPins = nullptr;
+        if (SUCCEEDED(baseFilter->EnumPins(&enumPins)) && enumPins) {
+            IPin *pin = nullptr;
+            ULONG pinFetched = 0;
+            while (enumPins->Next(1, &pin, &pinFetched) == S_OK) {
+                PIN_DIRECTION direction = PINDIR_INPUT;
+                if (FAILED(pin->QueryDirection(&direction)) || direction != PINDIR_OUTPUT) {
+                    pin->Release();
+                    pin = nullptr;
+                    continue;
+                }
+
+                IAMStreamConfig *streamConfig = nullptr;
+                const HRESULT hrCfg = pin->QueryInterface(IID_IAMStreamConfig,
+                                                          reinterpret_cast<void **>(&streamConfig));
+                if (FAILED(hrCfg) || !streamConfig) {
+                    pin->Release();
+                    pin = nullptr;
+                    continue;
+                }
+
+                int capCount = 0;
+                int capSize = 0;
+                if (FAILED(streamConfig->GetNumberOfCapabilities(&capCount, &capSize)) ||
+                        capCount <= 0 || capSize <= 0) {
+                    streamConfig->Release();
+                    pin->Release();
+                    pin = nullptr;
+                    continue;
+                }
+
+                QByteArray capBuffer(capSize, 0);
+                for (int capIndex = 0; capIndex < capCount; ++capIndex) {
+                    AM_MEDIA_TYPE *mediaType = nullptr;
+                    HRESULT hrCap = streamConfig->GetStreamCaps(capIndex,
+                                                                &mediaType,
+                                                                reinterpret_cast<BYTE *>(capBuffer.data()));
+                    if (FAILED(hrCap) || !mediaType) {
+                        continue;
+                    }
+
+                    LONG width = 0;
+                    LONG height = 0;
+                    LONGLONG avgTimePerFrame = 0;
+                    if (mediaType->formattype == FORMAT_VideoInfo &&
+                            mediaType->cbFormat >= static_cast<LONG>(sizeof(VIDEOINFOHEADER)) &&
+                            mediaType->pbFormat) {
+                        const VIDEOINFOHEADER *vih =
+                                reinterpret_cast<const VIDEOINFOHEADER *>(mediaType->pbFormat);
+                        width = vih->bmiHeader.biWidth;
+                        height = vih->bmiHeader.biHeight;
+                        avgTimePerFrame = vih->AvgTimePerFrame;
+                    } else if (mediaType->formattype == FORMAT_VideoInfo2 &&
+                               mediaType->cbFormat >= static_cast<LONG>(sizeof(VideoInfoHeader2Compat)) &&
+                               mediaType->pbFormat) {
+                        const VideoInfoHeader2Compat *vih2 =
+                                reinterpret_cast<const VideoInfoHeader2Compat *>(mediaType->pbFormat);
+                        width = vih2->bmiHeader.biWidth;
+                        height = vih2->bmiHeader.biHeight;
+                        avgTimePerFrame = vih2->AvgTimePerFrame;
+                    }
+
+                    const QString formatLabel = subtypeToLabel(mediaType->subtype);
+                    const double fps = fpsFromAvgTimePerFrame(avgTimePerFrame);
+
+                    double minFps = 0.0;
+                    double maxFps = 0.0;
+                    if (capSize >= static_cast<int>(sizeof(VIDEO_STREAM_CONFIG_CAPS))) {
+                        const VIDEO_STREAM_CONFIG_CAPS *caps =
+                                reinterpret_cast<const VIDEO_STREAM_CONFIG_CAPS *>(capBuffer.constData());
+                        minFps = fpsFromAvgTimePerFrame(caps->MaxFrameInterval);
+                        maxFps = fpsFromAvgTimePerFrame(caps->MinFrameInterval);
+                    }
+
+                    if (minFps <= 0.0 && maxFps <= 0.0 && fps > 0.0) {
+                        minFps = fps;
+                        maxFps = fps;
+                    }
+
+                    lines << QString("  mode #%1: %2x%3 format=%4 fps[%5,%6]")
+                             .arg(capIndex)
+                             .arg(width)
+                             .arg(qAbs(height))
+                             .arg(formatLabel)
+                             .arg(minFps, 0, 'f', 3)
+                             .arg(maxFps, 0, 'f', 3);
+                    ++modeCount;
+
+                    freeMediaType(mediaType);
+                }
+
+                streamConfig->Release();
+                pin->Release();
+                pin = nullptr;
+            }
+            enumPins->Release();
+            enumPins = nullptr;
+        }
+
+        baseFilter->Release();
+        moniker->Release();
+        moniker = nullptr;
+    }
+
+    enumMoniker->Release();
+    devEnum->Release();
+    if (shouldCoUninit) {
+        CoUninitialize();
+    }
+
+    if (reason) {
+        *reason = modeCount > 0
+                ? QStringLiteral("DirectShow enumerated %1 mode entries.").arg(modeCount)
+                : QStringLiteral("DirectShow did not report any mode entries.");
+    }
+    return modeCount > 0;
+#endif
 }
 
 // 枚举所有可见摄像头及其模式。

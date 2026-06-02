@@ -16,6 +16,7 @@
 #include <QByteArray>
 #include <QList>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
 
 // 单个相机模式描述：包括相机身份信息与对应 viewfinder 参数。
@@ -81,8 +82,8 @@ private:
     QString m_deviceName;
 };
 
-// Continuous raw YUYV surface used by live preview/streaming.
-// It deliberately advertises only YUYV so Qt will not negotiate RGB32.
+// Continuous surface used by live preview/streaming.
+// It accepts YUYV for XDMA streaming and JPEG/MJPG for selectable preview modes.
 class RawFrameSurface : public QAbstractVideoSurface
 {
     Q_OBJECT
@@ -119,6 +120,8 @@ public:
     static QString pixelFormatToString(QVideoFrame::PixelFormat fmt);
 
     static QList<CameraModeInfo> enumerateAllModes();
+    static bool enumerateAllModesViaDirectShow(QStringList &lines,
+                                               QString *reason = nullptr);
 
     // 仅筛选 YUY2/YUYV 模式，供上层优先抓取。
     static QList<CameraModeInfo> enumerateYuy2Modes();

@@ -1,4 +1,4 @@
-#include "widget.h"
+﻿#include "widget.h"
 #include "ui_widget.h"
 
 #include <QFile>
@@ -14,13 +14,16 @@
 #include <QLabel>
 #include <QFrame>
 #include <QSpinBox>
+#include <QComboBox>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QVector>
+#include <QSet>
 #include <vector>
 #include <cstring>
 
-// XDMA 辅助 API，由厂商 DLL 导出。
+// XDMA 杈呭姪 API锛岀敱鍘傚晢 DLL 瀵煎嚭銆?
 #include "xdmaDLL_public.h"
 
 namespace {
@@ -31,13 +34,140 @@ constexpr int kLiveRawBytesPerPixel = 2;
 constexpr int kLiveRawLineBytes = kLiveRawWidth * kLiveRawBytesPerPixel;
 constexpr int kLiveRawFrameBytes = kLiveRawLineBytes * kLiveRawHeight;
 
-// 句柄有效性判断：统一过滤空句柄与 INVALID_HANDLE_VALUE。
+QVideoFrame::PixelFormat pixelFormatFromModeTag(const QString &tag)
+{
+    const QString upper = tag.trimmed().toUpper();
+    if (upper == QLatin1String("YUY2") || upper == QLatin1String("YUYV")) {
+        return QVideoFrame::Format_YUYV;
+    }
+    if (upper == QLatin1String("UYVY")) {
+        return QVideoFrame::Format_UYVY;
+    }
+    if (upper == QLatin1String("MJPG") ||
+        upper == QLatin1String("MJPEG") ||
+        upper == QLatin1String("JPG") ||
+        upper == QLatin1String("JPEG")) {
+        return QVideoFrame::Format_Jpeg;
+    }
+    if (upper == QLatin1String("NV12")) {
+        return QVideoFrame::Format_NV12;
+    }
+    if (upper == QLatin1String("NV21")) {
+        return QVideoFrame::Format_NV21;
+    }
+    if (upper == QLatin1String("YV12")) {
+        return QVideoFrame::Format_YV12;
+    }
+    if (upper == QLatin1String("I420")) {
+        return QVideoFrame::Format_YUV420P;
+    }
+    if (upper == QLatin1String("RGB24")) {
+        return QVideoFrame::Format_RGB24;
+    }
+    if (upper == QLatin1String("RGB32")) {
+        return QVideoFrame::Format_RGB32;
+    }
+    if (upper == QLatin1String("ARGB32")) {
+        return QVideoFrame::Format_ARGB32;
+    }
+    return QVideoFrame::Format_Invalid;
+}
+bool parseDirectShowModeLine(const QString &line,
+                             int &width,
+                             int &height,
+                             QString &formatTag,
+                             double &minFps,
+                             double &maxFps)
+{
+    static const QRegularExpression re(
+                QStringLiteral("^\\s*mode\\s+#\\d+:\\s+(\\d+)x(\\d+)\\s+format=([^\\s]+)\\s+fps\\[(-?\\d+(?:\\.\\d+)?),(-?\\d+(?:\\.\\d+)?)\\]\\s*$"));
+    const QRegularExpressionMatch match = re.match(line);
+    if (!match.hasMatch()) {
+        return false;
+    }
+    width = match.captured(1).toInt();
+    height = match.captured(2).toInt();
+    formatTag = match.captured(3);
+    minFps = match.captured(4).toDouble();
+    maxFps = match.captured(5).toDouble();
+    return width > 0 && height > 0;
+}
+QList<CameraModeInfo> buildModesFromDirectShowLines(const QStringList &lines,
+                                                    const QList<QCameraInfo> &cameras)
+{
+    QList<CameraModeInfo> out;
+    QSet<QString> dedup;
+    int currentCameraIndex = cameras.isEmpty() ? -1 : 0;
+    static const QRegularExpression cameraRe(
+                QStringLiteral("^\\s*\\[CAMERA\\]\\s+#(\\d+)\\s+"));
+    for (const QString &line : lines) {
+        const QRegularExpressionMatch cameraMatch = cameraRe.match(line);
+        if (cameraMatch.hasMatch()) {
+            currentCameraIndex = cameraMatch.captured(1).toInt();
+            continue;
+        }
+        int width = 0;
+        int height = 0;
+        QString formatTag;
+        double minFps = 0.0;
+        double maxFps = 0.0;
+        if (!parseDirectShowModeLine(line, width, height, formatTag, minFps, maxFps)) {
+            continue;
+        }
+        if (currentCameraIndex < 0 || currentCameraIndex >= cameras.size()) {
+            continue;
+        }
+        const QVideoFrame::PixelFormat pixelFormat = pixelFormatFromModeTag(formatTag);
+        const QString key = QString("%1|%2x%3|%4|%5|%6")
+                .arg(currentCameraIndex)
+                .arg(width)
+                .arg(height)
+                .arg(static_cast<int>(pixelFormat))
+                .arg(minFps, 0, 'f', 3)
+                .arg(maxFps, 0, 'f', 3);
+        if (dedup.contains(key)) {
+            continue;
+        }
+        dedup.insert(key);
+        const QCameraInfo info = cameras[currentCameraIndex];
+        QCameraViewfinderSettings settings;
+        settings.setResolution(QSize(width, height));
+        if (pixelFormat != QVideoFrame::Format_Invalid) {
+            settings.setPixelFormat(pixelFormat);
+        }
+        if (minFps > 0.0) {
+            settings.setMinimumFrameRate(minFps);
+        }
+        if (maxFps > 0.0) {
+            settings.setMaximumFrameRate(maxFps);
+        }
+        CameraModeInfo mode;
+        mode.cameraIndex = currentCameraIndex;
+        mode.cameraInfo = info;
+        mode.description = info.description();
+        mode.deviceName = info.deviceName();
+        mode.settings = settings;
+        out.push_back(mode);
+    }
+    return out;
+}
+QString modeToComboText(const CameraModeInfo &mode)
+{
+    const QSize resolution = mode.settings.resolution();
+    return QString("%1x%2 | %3 | fps[%4,%5]")
+            .arg(resolution.width())
+            .arg(resolution.height())
+            .arg(CameraProbe::pixelFormatToString(mode.settings.pixelFormat()))
+            .arg(mode.settings.minimumFrameRate(), 0, 'f', 3)
+            .arg(mode.settings.maximumFrameRate(), 0, 'f', 3);
+}
+
 bool isValidHandle(HANDLE handle)
 {
     return handle != nullptr && handle != INVALID_HANDLE_VALUE;
 }
 
-// 像素分量钳位到 [0,255]，避免颜色计算溢出。
+// 鍍忕礌鍒嗛噺閽充綅鍒?[0,255]锛岄伩鍏嶉鑹茶绠楁孩鍑恒€?
 int clampToByte(int value)
 {
     if (value < 0) {
@@ -49,15 +179,13 @@ int clampToByte(int value)
     return value;
 }
 
-// 统一输出 32bit 十六进制文本（大写、固定 8 位）。
-// 用于寄存器读写日志与“读回值”展示，减少格式不一致问题。
+// 缁熶竴杈撳嚭 32bit 鍗佸叚杩涘埗鏂囨湰锛堝ぇ鍐欍€佸浐瀹?8 浣嶏級銆?// 鐢ㄤ簬瀵勫瓨鍣ㄨ鍐欐棩蹇椾笌鈥滆鍥炲€尖€濆睍绀猴紝鍑忓皯鏍煎紡涓嶄竴鑷撮棶棰樸€?
 QString toHex32(quint32 value)
 {
     return QString("0x%1").arg(value, 8, 16, QLatin1Char('0')).toUpper();
 }
 
-// 将一帧 YUYV 原始数据转换为 RGB888 图像。
-// 该函数用于“采一帧”后的 PNG 预览导出，不参与 XDMA 实时发送路径。
+// 灏嗕竴甯?YUYV 鍘熷鏁版嵁杞崲涓?RGB888 鍥惧儚銆?// 璇ュ嚱鏁扮敤浜庘€滈噰涓€甯р€濆悗鐨?PNG 棰勮瀵煎嚭锛屼笉鍙備笌 XDMA 瀹炴椂鍙戦€佽矾寰勩€?
 bool yuyvToRgbImage(const CapturedFrame &frame, QImage &outImage)
 {
     const int width = frame.resolution.width();
@@ -118,18 +246,18 @@ bool yuyvToRgbImage(const CapturedFrame &frame, QImage &outImage)
     return true;
 }
 
-} // 匿名命名空间
+} // 鍖垮悕鍛藉悕绌洪棿
 
 Widget::Widget(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Widget)
     , m_probe(new CameraProbe(this))
 {
-    // 初始化 UI、按钮默认状态和预览链路。
+    // 鍒濆鍖?UI銆佹寜閽粯璁ょ姸鎬佸拰棰勮閾捐矾銆?
     ui->setupUi(this);
-    // 软件协议自测不依赖 XDMA，可直接手动触发。
+    // 杞欢鍗忚鑷祴涓嶄緷璧?XDMA锛屽彲鐩存帴鎵嬪姩瑙﹀彂銆?
     ui->btnSendTestPacket->setEnabled(true);
-    // 硬件链路测试包依赖 XDMA 通道就绪，初始禁用。
+    // 纭欢閾捐矾娴嬭瘯鍖呬緷璧?XDMA 閫氶亾灏辩华锛屽垵濮嬬鐢ㄣ€?
     ui->btnSendLinkTestPacket->setEnabled(false);
     ui->btnSendCapturedFrame->setEnabled(false);
     initializePreview();
@@ -144,13 +272,13 @@ Widget::Widget(QWidget *parent)
 
 Widget::~Widget()
 {
-    // 析构顺序：先停数据链路（XDMA/预览），再释放 UI。
+    // 鏋愭瀯椤哄簭锛氬厛鍋滄暟鎹摼璺紙XDMA/棰勮锛夛紝鍐嶉噴鏀?UI銆?
     closeXdmaHandles();
     stopPreview();
     delete ui;
 }
 
-// 初始化实时预览：创建 Viewfinder、插入布局、挂接 VideoProbe。
+// 鍒濆鍖栧疄鏃堕瑙堬細鍒涘缓 Viewfinder銆佹彃鍏ュ竷灞€銆佹寕鎺?VideoProbe銆?
 void Widget::initializePreview()
 {
     m_previewLabel = new QLabel(this);
@@ -158,18 +286,123 @@ void Widget::initializePreview()
     m_previewLabel->setMinimumHeight(280);
     m_previewLabel->setAlignment(Qt::AlignCenter);
     m_previewLabel->setFrameShape(QFrame::StyledPanel);
-    m_previewLabel->setText(QStringLiteral("Waiting for 640x360 YUYV camera preview..."));
+    m_previewLabel->setText(QStringLiteral("Waiting for camera preview..."));
 
     ui->verticalLayout->insertWidget(1, m_previewLabel, 1);
+    initializeModeControls();
     initializeTransferControls();
     initializeAxiLiteControls();
 
     startPreview();
 }
 
-// 在界面中动态创建传输调参区：
-// - 节流间隔：控制实时帧发送最小间隔；
-// - 写入大小：控制视频主链路每次向 XDMA 写入的批次长度。
+// 鍦ㄧ晫闈腑鍔ㄦ€佸垱寤轰紶杈撹皟鍙傚尯锛?// - 鑺傛祦闂撮殧锛氭帶鍒跺疄鏃跺抚鍙戦€佹渶灏忛棿闅旓紱
+void Widget::initializeModeControls()
+{
+    QWidget *panel = new QWidget(this);
+    panel->setObjectName("cameraModePanel");
+    QHBoxLayout *row = new QHBoxLayout(panel);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(8);
+    QLabel *modeLabel = new QLabel(QString::fromWCharArray(L"\u6444\u50CF\u5934\u6A21\u5F0F:"), panel);
+    m_modeCombo = new QComboBox(panel);
+    m_modeCombo->setMinimumWidth(360);
+    m_applyModeBtn = new QPushButton(QString::fromWCharArray(L"\u5E94\u7528\u6A21\u5F0F"), panel);
+    row->addWidget(modeLabel);
+    row->addWidget(m_modeCombo, 1);
+    row->addWidget(m_applyModeBtn);
+    connect(m_applyModeBtn, &QPushButton::clicked,
+            this, &Widget::applySelectedModeFromCombo);
+    connect(m_modeCombo, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) {
+        applySelectedModeFromCombo();
+    });
+    ui->verticalLayout->insertWidget(2, panel);
+    refreshModeCombo();
+}
+void Widget::refreshModeCombo()
+{
+    if (!m_modeCombo) {
+        return;
+    }
+    const QString previousText = m_modeCombo->currentText();
+    const QSignalBlocker blocker(m_modeCombo);
+    m_modeCombo->clear();
+    m_availableModes.clear();
+    const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
+    QStringList directShowLines;
+    QString directShowReason;
+    if (CameraProbe::enumerateAllModesViaDirectShow(directShowLines, &directShowReason)) {
+        m_availableModes = buildModesFromDirectShowLines(directShowLines, cameras);
+    }
+    if (m_availableModes.isEmpty()) {
+        m_availableModes = CameraProbe::enumerateAllModes();
+    }
+    QList<CameraModeInfo> filtered;
+    filtered.reserve(m_availableModes.size());
+    for (const CameraModeInfo &mode : m_availableModes) {
+        const bool hasResolution = mode.settings.resolution().width() > 0
+                && mode.settings.resolution().height() > 0;
+        const bool hasFormat = mode.settings.pixelFormat() != QVideoFrame::Format_Invalid;
+        if (hasResolution || hasFormat) {
+            filtered.push_back(mode);
+        }
+    }
+    m_availableModes = filtered;
+    for (const CameraModeInfo &mode : m_availableModes) {
+        m_modeCombo->addItem(modeToComboText(mode));
+    }
+    if (m_modeCombo->count() == 0) {
+        m_modeCombo->addItem(QStringLiteral("No explicit camera mode available"));
+        m_modeCombo->setEnabled(false);
+        m_useManualPreviewMode = false;
+        if (m_applyModeBtn) {
+            m_applyModeBtn->setEnabled(false);
+        }
+        return;
+    }
+    m_modeCombo->setEnabled(true);
+    if (m_applyModeBtn) {
+        m_applyModeBtn->setEnabled(true);
+    }
+    int targetIndex = 0;
+    if (!previousText.isEmpty()) {
+        const int found = m_modeCombo->findText(previousText);
+        if (found >= 0) {
+            targetIndex = found;
+        }
+    }
+    m_modeCombo->setCurrentIndex(targetIndex);
+    if (targetIndex >= 0 && targetIndex < m_availableModes.size()) {
+        m_manualPreviewMode = m_availableModes[targetIndex];
+        m_useManualPreviewMode = true;
+    }
+}
+void Widget::applySelectedModeFromCombo()
+{
+    if (!m_modeCombo || m_availableModes.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[WARN] No selectable camera mode is available."));
+        return;
+    }
+    const int index = m_modeCombo->currentIndex();
+    if (index < 0 || index >= m_availableModes.size()) {
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[WARN] Please select a valid camera mode."));
+        return;
+    }
+    if (m_liveVideoSending) {
+        stopLiveVideoSending(QStringLiteral("camera mode switch"));
+    }
+    m_manualPreviewMode = m_availableModes[index];
+    m_useManualPreviewMode = true;
+    ui->plainTextEdit->appendPlainText(
+                QString("[INFO] Applying mode: %1")
+                .arg(modeToComboText(m_manualPreviewMode)));
+    stopPreview();
+    startPreview();
+}
+
 void Widget::initializeTransferControls()
 {
     QWidget *panel = new QWidget(this);
@@ -202,7 +435,7 @@ void Widget::initializeTransferControls()
 
     connect(m_throttleSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int value) {
-        // 运行时更新节流参数，无需重启预览或重建相机。
+        // 杩愯鏃舵洿鏂拌妭娴佸弬鏁帮紝鏃犻渶閲嶅惎棰勮鎴栭噸寤虹浉鏈恒€?
         m_liveStreamThrottleMs = qMax<qint64>(1, value);
         if (ui && ui->plainTextEdit) {
             ui->plainTextEdit->appendPlainText(
@@ -213,7 +446,7 @@ void Widget::initializeTransferControls()
 
     connect(m_chunkSizeSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int value) {
-        // 运行时更新写入批次参数，后续发送立即生效。
+        // 杩愯鏃舵洿鏂板啓鍏ユ壒娆″弬鏁帮紝鍚庣画鍙戦€佺珛鍗崇敓鏁堛€?
         const int kb = qMax(1, value);
         const int newBatchBytes = kb * 1024;
         const bool ok = m_videoPacketBatcher.setBatchBytes(newBatchBytes);
@@ -236,19 +469,16 @@ void Widget::initializeTransferControls()
 
     ui->verticalLayout->insertWidget(2, panel);
 
-    // 让封包聚合模块与 UI 初始值保持一致。
+    // 璁╁皝鍖呰仛鍚堟ā鍧椾笌 UI 鍒濆鍊间繚鎸佷竴鑷淬€?
     m_videoPacketBatcher.setBatchBytes(m_xdmaChunkBytes);
 }
 
-// 在界面中动态创建 AXI lite 寄存器调试区：
-// - 地址输入：支持十六进制（0x）或十进制；
-// - 写值输入：用于 32bit 写寄存器；
-// - 读值显示：展示最近一次读取结果；
-// - 读/写按钮：通过 XDMA user 通道访问 AXI lite。
+// 鍦ㄧ晫闈腑鍔ㄦ€佸垱寤?AXI lite 瀵勫瓨鍣ㄨ皟璇曞尯锛?// - 鍦板潃杈撳叆锛氭敮鎸佸崄鍏繘鍒讹紙0x锛夋垨鍗佽繘鍒讹紱
+// - 鍐欏€艰緭鍏ワ細鐢ㄤ簬 32bit 鍐欏瘎瀛樺櫒锛?// - 璇诲€兼樉绀猴細灞曠ず鏈€杩戜竴娆¤鍙栫粨鏋滐紱
+// - 璇?鍐欐寜閽細閫氳繃 XDMA user 閫氶亾璁块棶 AXI lite銆?
 void Widget::initializeAxiLiteControls()
 {
-    // 该 panel 放在主界面布局中，提供 AXI lite 读写入口。
-    // 采用“输入地址 + 读/写按钮 + 读回显示”的最小调试闭环。
+    // 璇?panel 鏀惧湪涓荤晫闈㈠竷灞€涓紝鎻愪緵 AXI lite 璇诲啓鍏ュ彛銆?    // 閲囩敤鈥滆緭鍏ュ湴鍧€ + 璇?鍐欐寜閽?+ 璇诲洖鏄剧ず鈥濈殑鏈€灏忚皟璇曢棴鐜€?
     QWidget *panel = new QWidget(this);
     panel->setObjectName("axiLiteRegPanel");
 
@@ -257,26 +487,26 @@ void Widget::initializeAxiLiteControls()
     row->setSpacing(8);
 
     QLabel *addrLabel = new QLabel(
-                QString::fromWCharArray(L"寄存器地址:"), panel);
+                QString::fromWCharArray(L"\u5BC4\u5B58\u5668\u5730\u5740:"), panel);
     m_regAddrEdit = new QLineEdit(panel);
     m_regAddrEdit->setPlaceholderText("0x00000000");
     m_regAddrEdit->setText("0x00000000");
     m_regAddrEdit->setMaximumWidth(130);
 
     QLabel *writeLabel = new QLabel(
-                QString::fromWCharArray(L"写入值:"), panel);
+                QString::fromWCharArray(L"\u5199\u5165\u503C:"), panel);
     m_regWriteValueEdit = new QLineEdit(panel);
     m_regWriteValueEdit->setPlaceholderText("0x00000000");
     m_regWriteValueEdit->setText("0x00000000");
     m_regWriteValueEdit->setMaximumWidth(130);
 
     QPushButton *readBtn = new QPushButton(
-                QString::fromWCharArray(L"读寄存器"), panel);
+                QString::fromWCharArray(L"\u8BFB\u5BC4\u5B58\u5668"), panel);
     QPushButton *writeBtn = new QPushButton(
-                QString::fromWCharArray(L"写寄存器"), panel);
+                QString::fromWCharArray(L"\u5199\u5BC4\u5B58\u5668"), panel);
 
     QLabel *readbackLabel = new QLabel(
-                QString::fromWCharArray(L"读回值:"), panel);
+                QString::fromWCharArray(L"\u8BFB\u56DE\u503C:"), panel);
     m_regReadValueEdit = new QLineEdit(panel);
     m_regReadValueEdit->setReadOnly(true);
     m_regReadValueEdit->setText("0x00000000");
@@ -293,10 +523,7 @@ void Widget::initializeAxiLiteControls()
     row->addStretch(1);
 
     connect(readBtn, &QPushButton::clicked, this, [this]() {
-        // 读寄存器流程：
-        // 1) 解析地址；
-        // 2) 调用 user 通道 read_device；
-        // 3) 更新读回框并写日志。
+        // 璇诲瘎瀛樺櫒娴佺▼锛?        // 1) 瑙ｆ瀽鍦板潃锛?        // 2) 璋冪敤 user 閫氶亾 read_device锛?        // 3) 鏇存柊璇诲洖妗嗗苟鍐欐棩蹇椼€?
         quint32 address = 0;
         if (!parseUiRegisterValue(m_regAddrEdit ? m_regAddrEdit->text() : QString(),
                                   address,
@@ -319,10 +546,8 @@ void Widget::initializeAxiLiteControls()
     });
 
     connect(writeBtn, &QPushButton::clicked, this, [this]() {
-        // 写寄存器流程：
-        // 1) 解析地址与写值；
-        // 2) 调用 user 通道 write_device；
-        // 3) 写日志确认本次写入参数。
+        // 鍐欏瘎瀛樺櫒娴佺▼锛?        // 1) 瑙ｆ瀽鍦板潃涓庡啓鍊硷紱
+        // 2) 璋冪敤 user 閫氶亾 write_device锛?        // 3) 鍐欐棩蹇楃‘璁ゆ湰娆″啓鍏ュ弬鏁般€?
         quint32 address = 0;
         quint32 value = 0;
         if (!parseUiRegisterValue(m_regAddrEdit ? m_regAddrEdit->text() : QString(),
@@ -349,8 +574,7 @@ void Widget::initializeAxiLiteControls()
     ui->verticalLayout->insertWidget(3, panel);
 }
 
-// 启动实时预览。
-// 若已有活动预览则直接返回，避免重复创建相机对象。
+// 鍚姩瀹炴椂棰勮銆?// 鑻ュ凡鏈夋椿鍔ㄩ瑙堝垯鐩存帴杩斿洖锛岄伩鍏嶉噸澶嶅垱寤虹浉鏈哄璞°€?
 void Widget::startPreview()
 {
     if (!m_previewLabel) {
@@ -363,10 +587,15 @@ void Widget::startPreview()
 
     CameraModeInfo selected;
     QString report;
-    if (!findStrictLiveYuyvMode(selected, &report)) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Live raw preview requires exact 640x360 YUYV. ") + report);
-        m_previewLabel->setText(QStringLiteral("No exact 640x360 YUYV camera mode."));
-        return;
+    if (m_useManualPreviewMode) {
+        selected = m_manualPreviewMode;
+        report = QStringLiteral("Manual preview mode selected from combo box.");
+    } else {
+        if (!findStrictLiveYuyvMode(selected, &report)) {
+            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Live raw preview requires exact 640x360 YUYV. ") + report);
+            m_previewLabel->setText(QStringLiteral("No exact 640x360 YUYV camera mode."));
+            return;
+        }
     }
     if (!report.isEmpty()) {
         ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + report);
@@ -405,7 +634,7 @@ void Widget::startPreview()
 
     m_previewCamera->start();
     ui->plainTextEdit->appendPlainText(
-                QString("[INFO] Live raw preview requested: camera=%1, dev=%2, resolution=%3x%4, format=%5, fps=[%6,%7]")
+                QString("[INFO] Camera preview requested: camera=%1, dev=%2, resolution=%3x%4, format=%5, fps=[%6,%7]")
                 .arg(selected.description)
                 .arg(selected.deviceName)
                 .arg(selected.settings.resolution().width())
@@ -453,6 +682,66 @@ void Widget::stopPreview()
         m_rawFrameSurface->deleteLater();
         m_rawFrameSurface = nullptr;
     }
+}
+
+void Widget::stopLiveVideoSending(const QString &reason)
+{
+    if (!m_liveVideoSending) {
+        return;
+    }
+
+    const int droppedPayloadBytes = m_videoPacketBatcher.pendingPayloadBytes();
+    m_videoPacketBatcher.discardPendingPayloadBytes();
+
+    int queuedBatchBytes = 0;
+    for (const QByteArray &batch : m_liveReadyBatches) {
+        queuedBatchBytes += batch.size();
+    }
+
+    const qint64 elapsedMs = m_liveSendStartMs > 0
+            ? qMax<qint64>(0, QDateTime::currentMSecsSinceEpoch() - m_liveSendStartMs)
+            : 0;
+
+    m_liveVideoSending = false;
+    m_liveSendStartMs = 0;
+    ui->btnSendLiveVideo->setText(QString::fromWCharArray(L"\u5F00\u59CB\u5B9E\u65F6\u89C6\u9891\u53D1\u9001(\u5C01\u5305+\u6279\u91CF)"));
+
+    const QString suffix = reason.isEmpty()
+            ? QString()
+            : QStringLiteral(", reason=%1").arg(reason);
+    ui->plainTextEdit->appendPlainText(
+                QString("[XDMA] Live camera streaming stopped. duration=%1 ms, sent batches=%2, cached-not-sent=%3 bytes, dropped-tail=%4 bytes%5")
+                .arg(elapsedMs)
+                .arg(m_liveSentBatches)
+                .arg(m_videoPacketBatcher.pendingBytes() + queuedBatchBytes)
+                .arg(droppedPayloadBytes)
+                .arg(suffix));
+
+    m_liveReadyBatches.clear();
+}
+
+bool Widget::selectedModeSupportsLiveStreaming(QString *reason) const
+{
+    if (!m_useManualPreviewMode) {
+        return true;
+    }
+
+    const QSize resolution = m_manualPreviewMode.settings.resolution();
+    const QVideoFrame::PixelFormat format = m_manualPreviewMode.settings.pixelFormat();
+    if (resolution == QSize(kLiveRawWidth, kLiveRawHeight) &&
+        format == QVideoFrame::Format_YUYV) {
+        return true;
+    }
+
+    if (reason) {
+        *reason = QString("Live XDMA streaming expects %1x%2 YUYV, current mode is %3x%4 %5.")
+                .arg(kLiveRawWidth)
+                .arg(kLiveRawHeight)
+                .arg(resolution.width())
+                .arg(resolution.height())
+                .arg(CameraProbe::pixelFormatToString(format));
+    }
+    return false;
 }
 
 bool Widget::findStrictLiveYuyvMode(CameraModeInfo &outMode, QString *report) const
@@ -600,12 +889,16 @@ void Widget::updateRawPreview(const CapturedFrame &frame)
     if (!m_previewLabel) {
         return;
     }
-    if (frame.pixelFormat != QVideoFrame::Format_YUYV) {
-        return;
-    }
-
     QImage image;
-    if (!yuyvToRgbImage(frame, image)) {
+    if (frame.pixelFormat == QVideoFrame::Format_YUYV) {
+        if (!yuyvToRgbImage(frame, image)) {
+            return;
+        }
+    } else if (frame.pixelFormat == QVideoFrame::Format_Jpeg) {
+        if (!image.loadFromData(frame.payload)) {
+            return;
+        }
+    } else {
         return;
     }
 
@@ -618,14 +911,11 @@ void Widget::updateRawPreview(const CapturedFrame &frame)
     }
 }
 
-// ===== 模块：UI 操作入口（按钮槽）与采集回调 =====
-// 说明：
-// 1) 先放“用户可直接触发”的按钮入口，便于从上到下理解业务流程；
-// 2) 再放采集/预览回调，形成完整的“入口 -> 回调 -> 底层发送”阅读路径。
-
-// ----- 子模块：采集与视频发送按钮 -----
-// 列出相机与模式信息。
-// 该函数用于联调阶段快速确认：设备可见性、驱动是否返回模式列表。
+// ===== 妯″潡锛歎I 鎿嶄綔鍏ュ彛锛堟寜閽Ы锛変笌閲囬泦鍥炶皟 =====
+// 璇存槑锛?// 1) 鍏堟斁鈥滅敤鎴峰彲鐩存帴瑙﹀彂鈥濈殑鎸夐挳鍏ュ彛锛屼究浜庝粠涓婂埌涓嬬悊瑙ｄ笟鍔℃祦绋嬶紱
+// 2) 鍐嶆斁閲囬泦/棰勮鍥炶皟锛屽舰鎴愬畬鏁寸殑鈥滃叆鍙?-> 鍥炶皟 -> 搴曞眰鍙戦€佲€濋槄璇昏矾寰勩€?
+// ----- 瀛愭ā鍧楋細閲囬泦涓庤棰戝彂閫佹寜閽?-----
+// 鍒楀嚭鐩告満涓庢ā寮忎俊鎭€?// 璇ュ嚱鏁扮敤浜庤仈璋冮樁娈靛揩閫熺‘璁わ細璁惧鍙鎬с€侀┍鍔ㄦ槸鍚﹁繑鍥炴ā寮忓垪琛ㄣ€?
 void Widget::on_btnListModes_clicked()
 {
     ui->plainTextEdit->clear();
@@ -654,35 +944,52 @@ void Widget::on_btnListModes_clicked()
                              .arg(info.deviceName());
     }
 
+    ui->plainTextEdit->appendPlainText("=== Mode Summary ===");
+    refreshModeCombo();
+
+    QStringList directShowLines;
+    QString directShowReason;
+    if (CameraProbe::enumerateAllModesViaDirectShow(directShowLines, &directShowReason)) {
+        ui->plainTextEdit->appendPlainText(QString("[INFO] %1").arg(directShowReason));
+        for (const QString &line : directShowLines) {
+            ui->plainTextEdit->appendPlainText(line);
+        }
+        return;
+    }
+
+    if (!directShowReason.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[WARN] DirectShow enumeration unavailable: %1").arg(directShowReason));
+    }
+
     const auto modes = CameraProbe::enumerateAllModes();
     QList<CameraModeInfo> validModes;
     validModes.reserve(modes.size());
-
-    ui->plainTextEdit->appendPlainText("=== Mode Summary ===");
     ui->plainTextEdit->appendPlainText(
-                QString("enumerated entries: %1").arg(modes.size()));
+                QString("enumerated entries (Qt fallback): %1").arg(modes.size()));
 
     for (const auto &m : modes) {
-        const bool validMode = m.settings.resolution().width() > 0
-                && m.settings.resolution().height() > 0
-                && m.settings.pixelFormat() != QVideoFrame::Format_Invalid;
-        if (validMode) {
+        const bool hasResolution = m.settings.resolution().width() > 0
+                && m.settings.resolution().height() > 0;
+        const bool hasPixelFormat = m.settings.pixelFormat() != QVideoFrame::Format_Invalid;
+        const bool hasFps = m.settings.minimumFrameRate() > 0.0
+                || m.settings.maximumFrameRate() > 0.0;
+        if (hasResolution || hasPixelFormat || hasFps) {
             validModes.push_back(m);
         }
     }
 
     ui->plainTextEdit->appendPlainText(
-                QString("valid entries: %1").arg(validModes.size()));
+                QString("valid entries (Qt fallback): %1").arg(validModes.size()));
 
     if (validModes.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
-                    QStringLiteral("[INFO] No explicit camera mode list was returned by the driver. Preview/capture will use camera default mode."));
+                    QStringLiteral("[INFO] No explicit camera mode list was returned by either DirectShow or Qt. Preview/capture will use camera default mode."));
         return;
     }
 
-    ui->plainTextEdit->appendPlainText("top valid modes:");
-    const int showCount = qMin(validModes.size(), 8);
-    for (int i = 0; i < showCount; ++i) {
+    ui->plainTextEdit->appendPlainText("all valid fallback modes:");
+    for (int i = 0; i < validModes.size(); ++i) {
         const CameraModeInfo &m = validModes[i];
         ui->plainTextEdit->appendPlainText(
                     QString("  #%1 cam=%2 %3x%4 %5 fps[%6,%7]")
@@ -694,14 +1001,9 @@ void Widget::on_btnListModes_clicked()
                     .arg(m.settings.minimumFrameRate())
                     .arg(m.settings.maximumFrameRate()));
     }
-
-    if (validModes.size() > showCount) {
-        ui->plainTextEdit->appendPlainText(
-                    QString("  ... %1 more").arg(validModes.size() - showCount));
-    }
 }
 
-// 单帧抓取入口：优先请求 YUY2 指定分辨率，失败则回退默认模式。
+// 鍗曞抚鎶撳彇鍏ュ彛锛氫紭鍏堣姹?YUY2 鎸囧畾鍒嗚鲸鐜囷紝澶辫触鍒欏洖閫€榛樿妯″紡銆?
 void Widget::on_btnGrabOneFrame_clicked()
 {
     const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
@@ -712,7 +1014,11 @@ void Widget::on_btnGrabOneFrame_clicked()
 
     CameraModeInfo selected;
     QString reason;
-    if (CameraProbe::findPreferredYuy2Mode(640, 480, selected, &reason)) {
+    if (m_useManualPreviewMode) {
+        selected = m_manualPreviewMode;
+        reason = QStringLiteral("Single-frame capture uses the selected camera mode.");
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + reason);
+    } else if (CameraProbe::findPreferredYuy2Mode(640, 480, selected, &reason)) {
         ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + reason);
     } else {
         const QCameraInfo info = cameras.first();
@@ -729,7 +1035,7 @@ void Widget::on_btnGrabOneFrame_clicked()
     }
 
     ui->plainTextEdit->appendPlainText(
-                QString("[INFO] 准备采集: camera=%1, dev=%2, resolution=%3x%4, format=%5, fps=[%6,%7]")
+                QString("[INFO] 鍑嗗閲囬泦: camera=%1, dev=%2, resolution=%3x%4, format=%5, fps=[%6,%7]")
                 .arg(selected.description)
                 .arg(selected.deviceName)
                 .arg(selected.settings.resolution().width())
@@ -747,14 +1053,14 @@ void Widget::on_btnGrabOneFrame_clicked()
     }
 }
 
-// 发送“采一帧”缓存到的最近负载。
+// 鍙戦€佲€滈噰涓€甯р€濈紦瀛樺埌鐨勬渶杩戣礋杞姐€?
 void Widget::on_btnSendCapturedFrame_clicked()
 {
-    // 解耦路径：采集与发送分离。
-    // 本按钮始终从“最近一次保存的 raw 文件”重读数据并发送，避免受内存态影响。
+    // 瑙ｈ€﹁矾寰勶細閲囬泦涓庡彂閫佸垎绂汇€?
+    // 鏈寜閽缁堜粠鈥滄渶杩戜竴娆′繚瀛樼殑 raw 鏂囦欢鈥濋噸璇绘暟鎹苟鍙戦€侊紝閬垮厤鍙楀唴瀛樻€佸奖鍝嶃€?
     if (m_lastCapturedRawPath.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
-                    QStringLiteral("[ERROR] No captured frame cached. Please click \"采一帧\" first."));
+                    QStringLiteral("[ERROR] No captured frame cached. Please capture one frame first."));
         return;
     }
 
@@ -807,13 +1113,17 @@ void Widget::on_btnSendCapturedFrame_clicked()
     }
 }
 
-// 实时发送开关按钮。
-// 开启后由 onRawFrameAvailable 按节流间隔采样并发送；关闭后仅保留预览不发送。
+// 瀹炴椂鍙戦€佸紑鍏虫寜閽€?// 寮€鍚悗鐢?onRawFrameAvailable 鎸夎妭娴侀棿闅旈噰鏍峰苟鍙戦€侊紱鍏抽棴鍚庝粎淇濈暀棰勮涓嶅彂閫併€?
 void Widget::on_btnSendLiveVideo_clicked()
 {
-    // 运行时开关路径：RawFrameSurface -> YUYV normalize -> sendVideoPayloadWithBatching -> h2c_0。
-    // 这里只切换“是否发送”，不改变相机采集参数。
+    // 杩愯鏃跺紑鍏宠矾寰勶細RawFrameSurface -> YUYV normalize -> sendVideoPayloadWithBatching -> h2c_0銆?
+    // 杩欓噷鍙垏鎹⑩€滄槸鍚﹀彂閫佲€濓紝涓嶆敼鍙樼浉鏈洪噰闆嗗弬鏁般€?
     if (!m_liveVideoSending) {
+        QString modeReason;
+        if (!selectedModeSupportsLiveStreaming(&modeReason)) {
+            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Cannot start live streaming: ") + modeReason);
+            return;
+        }
         if (!m_previewCamera || m_previewCamera->state() != QCamera::ActiveState) {
             startPreview();
         }
@@ -828,50 +1138,29 @@ void Widget::on_btnSendLiveVideo_clicked()
         m_lastLiveSendMs = 0;
         m_liveSentBatches = 0;
         m_liveReadyBatches.clear();
-        ui->btnSendLiveVideo->setText(QString::fromUtf8("停止实时视频发送(封包+批量)"));
+        ui->btnSendLiveVideo->setText(QString::fromWCharArray(L"\u505C\u6B62\u5B9E\u65F6\u89C6\u9891\u53D1\u9001(\u5C01\u5305+\u6279\u91CF)"));
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[XDMA] Live camera streaming to h2c_0 started."));
         return;
     }
 
-    const int droppedPayloadBytes = m_videoPacketBatcher.pendingPayloadBytes();
-    m_videoPacketBatcher.discardPendingPayloadBytes();
-    int queuedBatchBytes = 0;
-    for (const QByteArray &batch : m_liveReadyBatches) {
-        queuedBatchBytes += batch.size();
-    }
-
-    const qint64 elapsedMs = m_liveSendStartMs > 0
-            ? qMax<qint64>(0, QDateTime::currentMSecsSinceEpoch() - m_liveSendStartMs)
-            : 0;
-
-    m_liveVideoSending = false;
-    m_liveSendStartMs = 0;
-    ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
-    ui->plainTextEdit->appendPlainText(
-                QString("[XDMA] Live camera streaming stopped. duration=%1 ms, sent batches=%2, cached-not-sent=%3 bytes, dropped-tail=%4 bytes")
-                .arg(elapsedMs)
-                .arg(m_liveSentBatches)
-                .arg(m_videoPacketBatcher.pendingBytes() + queuedBatchBytes)
-                .arg(droppedPayloadBytes));
-    m_liveReadyBatches.clear();
+    stopLiveVideoSending();
 }
 
-// ----- 子模块：XDMA 与测试按钮 -----
-// 手动打开 XDMA 并执行 ready_state 自检。
+// ----- 瀛愭ā鍧楋細XDMA 涓庢祴璇曟寜閽?-----
+// 鎵嬪姩鎵撳紑 XDMA 骞舵墽琛?ready_state 鑷銆?
 void Widget::on_btnOpenXdma_clicked()
 {
-    // 手动打开+自检入口，便于联调和上电验证。
-    // 实时发送和手动发送路径也支持自动打开兜底。
+    // 鎵嬪姩鎵撳紑+鑷鍏ュ彛锛屼究浜庤仈璋冨拰涓婄數楠岃瘉銆?
+    // 瀹炴椂鍙戦€佸拰鎵嬪姩鍙戦€佽矾寰勪篃鏀寔鑷姩鎵撳紑鍏滃簳銆?
     openXdmaAndSelfCheck();
 }
 
-// 发送测试包按钮槽。
+// 鍙戦€佹祴璇曞寘鎸夐挳妲姐€?
 void Widget::on_btnSendTestPacket_clicked()
 {
-    // 手动触发软件侧封包/聚合自测：
-    // 1) 验证 1024B 包头字段、length 与补零规则；
-    // 2) 验证默认配置下 1024 包是否准确聚合为 1MiB。
+    // 鎵嬪姩瑙﹀彂杞欢渚у皝鍖?鑱氬悎鑷祴锛?    // 1) 楠岃瘉 1024B 鍖呭ご瀛楁銆乴ength 涓庤ˉ闆惰鍒欙紱
+    // 2) 楠岃瘉榛樿閰嶇疆涓?1024 鍖呮槸鍚﹀噯纭仛鍚堜负 1MiB銆?
     runPacketModuleSelfTest();
 }
 
@@ -882,25 +1171,23 @@ void Widget::on_btnClearLog_clicked()
     }
 }
 
-// XDMA 链路测试包按钮槽。
+// XDMA 閾捐矾娴嬭瘯鍖呮寜閽Ы銆?
 void Widget::on_btnSendLinkTestPacket_clicked()
 {
-    // 无相机依赖的固定测试包路径，用于快速验证 PC->FPGA H2C 链路。
-    // 与“软件协议自测”分开，避免测试职责混用。
+    // 鏃犵浉鏈轰緷璧栫殑鍥哄畾娴嬭瘯鍖呰矾寰勶紝鐢ㄤ簬蹇€熼獙璇?PC->FPGA H2C 閾捐矾銆?
+    // 涓庘€滆蒋浠跺崗璁嚜娴嬧€濆垎寮€锛岄伩鍏嶆祴璇曡亴璐ｆ贩鐢ㄣ€?
     sendXdmaTestPacket();
 }
 
-// ----- 子模块：采集与预览回调 -----
-// 透传 CameraProbe 日志到界面。
+// ----- 瀛愭ā鍧楋細閲囬泦涓庨瑙堝洖璋?-----
+// 閫忎紶 CameraProbe 鏃ュ織鍒扮晫闈€?
 void Widget::onProbeLog(const QString &msg)
 {
     ui->plainTextEdit->appendPlainText("[LOG] " + msg);
 }
 
-// 单帧抓取成功回调：
-// 1) 保存 raw；
-// 2) 缓存 payload 供手动 XDMA 发送；
-// 3) 若格式是 YUYV，则额外导出 PNG 预览。
+// 鍗曞抚鎶撳彇鎴愬姛鍥炶皟锛?// 1) 淇濆瓨 raw锛?// 2) 缂撳瓨 payload 渚涙墜鍔?XDMA 鍙戦€侊紱
+// 3) 鑻ユ牸寮忔槸 YUYV锛屽垯棰濆瀵煎嚭 PNG 棰勮銆?
 void Widget::onProbeSuccess(const CapturedFrame &frame)
 {
     QString fmtTag = CameraProbe::pixelFormatToString(frame.pixelFormat).toLower();
@@ -979,7 +1266,7 @@ void Widget::onProbeSuccess(const CapturedFrame &frame)
     }
 
     if (m_restartPreviewAfterCapture) {
-        // 抓帧结束后延迟恢复预览，降低重入风险。
+        // 鎶撳抚缁撴潫鍚庡欢杩熸仮澶嶉瑙堬紝闄嶄綆閲嶅叆椋庨櫓銆?
         m_restartPreviewAfterCapture = false;
         QTimer::singleShot(120, this, [this]() {
             startPreview();
@@ -987,7 +1274,7 @@ void Widget::onProbeSuccess(const CapturedFrame &frame)
     }
 }
 
-// 单帧抓取失败回调：记录原因并按需恢复预览。
+// 鍗曞抚鎶撳彇澶辫触鍥炶皟锛氳褰曞師鍥犲苟鎸夐渶鎭㈠棰勮銆?
 void Widget::onProbeFailed(const QString &reason)
 {
     ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] ") + reason);
@@ -1000,7 +1287,7 @@ void Widget::onProbeFailed(const QString &reason)
     }
 }
 
-// 预览相机错误回调。
+// 棰勮鐩告満閿欒鍥炶皟銆?
 void Widget::onPreviewCameraError(QCamera::Error error)
 {
     Q_UNUSED(error);
@@ -1009,10 +1296,9 @@ void Widget::onPreviewCameraError(QCamera::Error error)
     ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Live preview error: ") + msg);
 }
 
-// Raw YUYV 帧回调：
-// 1) 同一份原始帧转 RGB 更新预览；
-// 2) 节流窗口到达时才采当前帧发送；
-// 3) 发送前规范化为连续 640x360 YUYV(460800B)。
+// Raw YUYV 甯у洖璋冿細
+// 1) 鍚屼竴浠藉師濮嬪抚杞?RGB 鏇存柊棰勮锛?// 2) 鑺傛祦绐楀彛鍒拌揪鏃舵墠閲囧綋鍓嶅抚鍙戦€侊紱
+// 3) 鍙戦€佸墠瑙勮寖鍖栦负杩炵画 640x360 YUYV(460800B)銆?
 void Widget::onRawFrameAvailable(const CapturedFrame &frame)
 {
     updateRawPreview(frame);
@@ -1047,25 +1333,21 @@ void Widget::onRawFrameAvailable(const CapturedFrame &frame)
                 : 0;
         m_liveVideoSending = false;
         m_liveSendStartMs = 0;
-        ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
+        ui->btnSendLiveVideo->setText(QString::fromWCharArray(L"\u5F00\u59CB\u5B9E\u65F6\u89C6\u9891\u53D1\u9001(\u5C01\u5305+\u6279\u91CF)"));
         ui->plainTextEdit->appendPlainText(
                     QString("[ERROR] Live raw YUYV streaming stopped due to XDMA write failure. duration=%1 ms")
                     .arg(elapsedMs));
         return;
     }
 }
-// ===== 模块：传输与 XDMA 底层实现 =====
-// 说明：
-// 1) 该模块只承载“通道管理 + 发送执行 + 自测执行”；
-// 2) 上层按钮/回调只调用本模块，不直接触碰驱动细节。
-
-// ----- 子模块：XDMA 通道管理 -----
-// 关闭 XDMA 句柄并复位会话状态。
+// ===== 妯″潡锛氫紶杈撲笌 XDMA 搴曞眰瀹炵幇 =====
+// 璇存槑锛?// 1) 璇ユā鍧楀彧鎵胯浇鈥滈€氶亾绠＄悊 + 鍙戦€佹墽琛?+ 鑷祴鎵ц鈥濓紱
+// 2) 涓婂眰鎸夐挳/鍥炶皟鍙皟鐢ㄦ湰妯″潡锛屼笉鐩存帴瑙︾椹卞姩缁嗚妭銆?
+// ----- 瀛愭ā鍧楋細XDMA 閫氶亾绠＄悊 -----
+// 鍏抽棴 XDMA 鍙ユ焺骞跺浣嶄細璇濈姸鎬併€?
 void Widget::closeXdmaHandles()
 {
-    // 重连或退出时都要关闭两类句柄。
-    // 封装库内部通常用 CreateFile 打开通道，
-    // 因此每个成功打开的通道都必须对应 CloseHandle。
+    // 閲嶈繛鎴栭€€鍑烘椂閮借鍏抽棴涓ょ被鍙ユ焺銆?    // 灏佽搴撳唴閮ㄩ€氬父鐢?CreateFile 鎵撳紑閫氶亾锛?    // 鍥犳姣忎釜鎴愬姛鎵撳紑鐨勯€氶亾閮藉繀椤诲搴?CloseHandle銆?
     const HANDLE h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
     const HANDLE user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
 
@@ -1085,19 +1367,14 @@ void Widget::closeXdmaHandles()
     }
 }
 
-// 打开 XDMA 并做基础自检：
-// 1) 枚举设备；
-// 2) 打开 user 通道；
-// 3) 打开 h2c_0 通道；
-// 4) 读取 ready_state。
+// 鎵撳紑 XDMA 骞跺仛鍩虹鑷锛?// 1) 鏋氫妇璁惧锛?// 2) 鎵撳紑 user 閫氶亾锛?// 3) 鎵撳紑 h2c_0 閫氶亾锛?// 4) 璇诲彇 ready_state銆?
 bool Widget::openXdmaAndSelfCheck()
 {
-    // 重开策略：先清理旧句柄，再做一次完整打开流程。
+    // 閲嶅紑绛栫暐锛氬厛娓呯悊鏃у彞鏌勶紝鍐嶅仛涓€娆″畬鏁存墦寮€娴佺▼銆?
     closeXdmaHandles();
 
     constexpr int kMaxDevices = 16;
-    constexpr size_t kPathLength = 1024; // 可以考虑改成260 + 1 以适配 Windows MAX_PATH，但目前驱动似乎不会返回过长路径。
-
+    constexpr size_t kPathLength = 1024; // 鍙互鑰冭檻鏀规垚260 + 1 浠ラ€傞厤 Windows MAX_PATH锛屼絾鐩墠椹卞姩浼间箮涓嶄細杩斿洖杩囬暱璺緞銆?
     std::vector<QByteArray> pathBuffers;
     pathBuffers.reserve(kMaxDevices);
     std::vector<char *> pathPtrs(kMaxDevices, nullptr);
@@ -1106,8 +1383,8 @@ bool Widget::openXdmaAndSelfCheck()
         pathPtrs[i] = pathBuffers[i].data();
     }
 
-    // 1) 枚举 GUID_DEVINTERFACE_XDMA 对应的基础设备路径。
-    // 封装函数会把每个设备路径写入传入的字符缓冲区。
+    // 1) 鏋氫妇 GUID_DEVINTERFACE_XDMA 瀵瑰簲鐨勫熀纭€璁惧璺緞銆?
+    // 灏佽鍑芥暟浼氭妸姣忎釜璁惧璺緞鍐欏叆浼犲叆鐨勫瓧绗︾紦鍐插尯銆?
     const int deviceCount = get_devices(GUID_DEVINTERFACE_XDMA, pathPtrs.data(), kPathLength);
     ui->plainTextEdit->appendPlainText(QString("[XDMA] detected devices: %1").arg(deviceCount));
     if (deviceCount <= 0) {
@@ -1141,7 +1418,7 @@ bool Widget::openXdmaAndSelfCheck()
     ui->plainTextEdit->appendPlainText(
                 QString("[XDMA] selected path index=%1").arg(selectedIndex));
 
-    // 2) 先打开 user（控制/BAR）通道。
+    // 2) 鍏堟墦寮€ user锛堟帶鍒?BAR锛夐€氶亾銆?
     HANDLE userHandle = nullptr;
     {
         QByteArray userPath = basePath;
@@ -1155,7 +1432,7 @@ bool Widget::openXdmaAndSelfCheck()
         }
     }
 
-    // 3) 打开 h2c_0 流发送通道，用于主机到 FPGA 的数据传输。
+    // 3) 鎵撳紑 h2c_0 娴佸彂閫侀€氶亾锛岀敤浜庝富鏈哄埌 FPGA 鐨勬暟鎹紶杈撱€?
     HANDLE h2cHandle = nullptr;
     {
         QByteArray h2cPath = basePath;
@@ -1173,7 +1450,7 @@ bool Widget::openXdmaAndSelfCheck()
     m_xdmaUserHandle = reinterpret_cast<void *>(userHandle);
     m_xdmaH2c0Handle = reinterpret_cast<void *>(h2cHandle);
 
-    // 4) 调用 ready_state 做自检（具体语义由厂商 API 定义）。
+    // 4) 璋冪敤 ready_state 鍋氳嚜妫€锛堝叿浣撹涔夌敱鍘傚晢 API 瀹氫箟锛夈€?
     unsigned int opState = 0;
     unsigned int ddrState = 0;
     const int readyRet = ready_state(userHandle, &opState, &ddrState);
@@ -1197,10 +1474,7 @@ bool Widget::parseUiRegisterValue(const QString &text,
                                   quint32 &outValue,
                                   const QString &fieldName)
 {
-    // 输入支持：
-    // - 16进制：如 0x80、0x0C、0X1；
-    // - 10进制：如 128。
-    // toULongLong(base=0) 会按前缀自动识别进制。
+    // 杈撳叆鏀寔锛?    // - 16杩涘埗锛氬 0x80銆?x0C銆?X1锛?    // - 10杩涘埗锛氬 128銆?    // toULongLong(base=0) 浼氭寜鍓嶇紑鑷姩璇嗗埆杩涘埗銆?
     const QString trimmed = text.trimmed();
     if (trimmed.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
@@ -1224,7 +1498,7 @@ bool Widget::parseUiRegisterValue(const QString &text,
 
 bool Widget::readUserRegister(quint32 address, quint32 &value)
 {
-    // AXI lite 32bit 寄存器访问要求 4 字节对齐。
+    // AXI lite 32bit 瀵勫瓨鍣ㄨ闂姹?4 瀛楄妭瀵归綈銆?
     if ((address & 0x3u) != 0) {
         ui->plainTextEdit->appendPlainText(
                     QString("[AXIL][ERROR] Register address must be 4-byte aligned: %1")
@@ -1234,7 +1508,7 @@ bool Widget::readUserRegister(quint32 address, quint32 &value)
 
     HANDLE user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
     if (!isValidHandle(user)) {
-        // 用户未手动点“打开XDMA通道并自检”时，提供自动兜底。
+        // 鐢ㄦ埛鏈墜鍔ㄧ偣鈥滄墦寮€XDMA閫氶亾骞惰嚜妫€鈥濇椂锛屾彁渚涜嚜鍔ㄥ厹搴曘€?
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[AXIL] user channel is not open, trying auto-open..."));
         if (!openXdmaAndSelfCheck()) {
@@ -1252,7 +1526,7 @@ bool Widget::readUserRegister(quint32 address, quint32 &value)
     }
 
     unsigned int raw = 0;
-    // user 通道按地址偏移读 4 字节寄存器值。
+    // user 閫氶亾鎸夊湴鍧€鍋忕Щ璇?4 瀛楄妭瀵勫瓨鍣ㄥ€笺€?
     const int ret = read_device(user,
                                 static_cast<long>(address),
                                 4,
@@ -1271,7 +1545,7 @@ bool Widget::readUserRegister(quint32 address, quint32 &value)
 
 bool Widget::writeUserRegister(quint32 address, quint32 value)
 {
-    // AXI lite 32bit 寄存器访问要求 4 字节对齐。
+    // AXI lite 32bit 瀵勫瓨鍣ㄨ闂姹?4 瀛楄妭瀵归綈銆?
     if ((address & 0x3u) != 0) {
         ui->plainTextEdit->appendPlainText(
                     QString("[AXIL][ERROR] Register address must be 4-byte aligned: %1")
@@ -1281,7 +1555,7 @@ bool Widget::writeUserRegister(quint32 address, quint32 value)
 
     HANDLE user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
     if (!isValidHandle(user)) {
-        // 用户未手动点“打开XDMA通道并自检”时，提供自动兜底。
+        // 鐢ㄦ埛鏈墜鍔ㄧ偣鈥滄墦寮€XDMA閫氶亾骞惰嚜妫€鈥濇椂锛屾彁渚涜嚜鍔ㄥ厹搴曘€?
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[AXIL] user channel is not open, trying auto-open..."));
         if (!openXdmaAndSelfCheck()) {
@@ -1299,7 +1573,7 @@ bool Widget::writeUserRegister(quint32 address, quint32 value)
     }
 
     unsigned int raw = static_cast<unsigned int>(value);
-    // user 通道按地址偏移写 4 字节寄存器值。
+    // user 閫氶亾鎸夊湴鍧€鍋忕Щ鍐?4 瀛楄妭瀵勫瓨鍣ㄥ€笺€?
     const int ret = write_device(user,
                                  static_cast<long>(address),
                                  4,
@@ -1315,26 +1589,18 @@ bool Widget::writeUserRegister(quint32 address, quint32 value)
     return true;
 }
 
-// ----- 子模块：发送执行（底层/业务桥接） -----
-// 通用 XDMA 发送函数。
-// 输入 payload 为“原始字节流”，函数内部负责：
-// - 自动打开 h2c_0（必要时）；
-// - 对齐缓冲区申请与拷贝；
-// - 默认分块 write_device 循环发送，forceSingleWrite 时单次发送；
-// - 失败回滚与日志。
+// ----- 瀛愭ā鍧楋細鍙戦€佹墽琛岋紙搴曞眰/涓氬姟妗ユ帴锛?-----
+// 閫氱敤 XDMA 鍙戦€佸嚱鏁般€?// 杈撳叆 payload 涓衡€滃師濮嬪瓧鑺傛祦鈥濓紝鍑芥暟鍐呴儴璐熻矗锛?// - 鑷姩鎵撳紑 h2c_0锛堝繀瑕佹椂锛夛紱
+// - 瀵归綈缂撳啿鍖虹敵璇蜂笌鎷疯礉锛?// - 榛樿鍒嗗潡 write_device 寰幆鍙戦€侊紝forceSingleWrite 鏃跺崟娆″彂閫侊紱
+// - 澶辫触鍥炴粴涓庢棩蹇椼€?
 bool Widget::sendXdmaPayload(const QByteArray &payload,
                              const QString &label,
                              bool verbose,
                              bool forceSingleWrite)
 {
-    // XDMA 通用发送路径，供以下场景复用：
-    // - 手动发送最近采集帧；
-    // - 发送测试包；
-    // - 实时视频流发送。
-    // 流程：
-    // 1) 如未打开通道则自动打开 XDMA；
-    // 2) 将 payload 拷贝到对齐缓冲区（allocate_buffer）；
-    // 3) 在 h2c_0 上写入（forceSingleWrite=true 时严格单次写入）。
+    // XDMA 閫氱敤鍙戦€佽矾寰勶紝渚涗互涓嬪満鏅鐢細
+    // - 鎵嬪姩鍙戦€佹渶杩戦噰闆嗗抚锛?    // - 鍙戦€佹祴璇曞寘锛?    // - 瀹炴椂瑙嗛娴佸彂閫併€?    // 娴佺▼锛?    // 1) 濡傛湭鎵撳紑閫氶亾鍒欒嚜鍔ㄦ墦寮€ XDMA锛?    // 2) 灏?payload 鎷疯礉鍒板榻愮紦鍐插尯锛坅llocate_buffer锛夛紱
+    // 3) 鍦?h2c_0 涓婂啓鍏ワ紙forceSingleWrite=true 鏃朵弗鏍煎崟娆″啓鍏ワ級銆?
     if (payload.isEmpty()) {
         ui->plainTextEdit->appendPlainText(QString("[ERROR] %1 is empty, skip XDMA send.").arg(label));
         return false;
@@ -1368,9 +1634,8 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
 
     int sent = 0;
     if (forceSingleWrite) {
-        // 视频批次路径要求“一批一写”：
-        // 若驱动返回值不是 totalBytes，视为失败并立即上报，避免
-        // 上层误以为该批已经完整送达 FPGA。
+        // 瑙嗛鎵规璺緞瑕佹眰鈥滀竴鎵逛竴鍐欌€濓細
+        // 鑻ラ┍鍔ㄨ繑鍥炲€间笉鏄?totalBytes锛岃涓哄け璐ュ苟绔嬪嵆涓婃姤锛岄伩鍏?        // 涓婂眰璇互涓鸿鎵瑰凡缁忓畬鏁撮€佽揪 FPGA銆?
         const int written = write_device(h2c,
                                          0x00000000,
                                          static_cast<DWORD>(totalBytes),
@@ -1387,9 +1652,7 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
         }
         sent = written;
     } else {
-        // 历史兼容路径：
-        // 分块发送可提升大包写入稳定性，也更便于定位失败位置。
-        // 注意：视频主链路不会走这个分支。
+        // 鍘嗗彶鍏煎璺緞锛?        // 鍒嗗潡鍙戦€佸彲鎻愬崌澶у寘鍐欏叆绋冲畾鎬э紝涔熸洿渚夸簬瀹氫綅澶辫触浣嶇疆銆?        // 娉ㄦ剰锛氳棰戜富閾捐矾涓嶄細璧拌繖涓垎鏀€?
         const int chunkBytes = qMax(4 * 1024, m_xdmaChunkBytes);
         while (sent < totalBytes) {
             const int remain = totalBytes - sent;
@@ -1419,8 +1682,8 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
     return true;
 }
 
-// 视频数据发送链路：
-// 原始视频字节流 -> 1024B 封包 -> 可配置批次聚合 -> XDMA 发送。
+// 瑙嗛鏁版嵁鍙戦€侀摼璺細
+// 鍘熷瑙嗛瀛楄妭娴?-> 1024B 灏佸寘 -> 鍙厤缃壒娆¤仛鍚?-> XDMA 鍙戦€併€?
 bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                           const QString &label,
                                           bool verbose,
@@ -1438,10 +1701,8 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
         m_liveReadyBatches.append(batch);
     }
 
-    // [PKG] 日志用于观察三层关系：
-    // - raw：输入原始视频字节数；
-    // - packets：本次封包后的 1024B 包数量；
-    // - emitted/cached：本次产出的完整批次、累计待发批次与缓存字节。
+    // [PKG] 鏃ュ織鐢ㄤ簬瑙傚療涓夊眰鍏崇郴锛?    // - raw锛氳緭鍏ュ師濮嬭棰戝瓧鑺傛暟锛?    // - packets锛氭湰娆″皝鍖呭悗鐨?1024B 鍖呮暟閲忥紱
+    // - emitted/cached锛氭湰娆′骇鍑虹殑瀹屾暣鎵规銆佺疮璁″緟鍙戞壒娆′笌缂撳瓨瀛楄妭銆?
     if (verbose || !readyBatches.isEmpty()) {
         const int batchKB = m_videoPacketBatcher.batchBytes() / 1024;
         int queuedBatchBytes = 0;
@@ -1468,7 +1729,7 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
 
     const int totalBatches = m_liveReadyBatches.size();
     for (int i = 0; i < totalBatches; ++i) {
-        // 仅在节流时间窗到达时发送，并保持“一批次一次写”。
+        // 浠呭湪鑺傛祦鏃堕棿绐楀埌杈炬椂鍙戦€侊紝骞朵繚鎸佲€滀竴鎵规涓€娆″啓鈥濄€?
         const QByteArray batch = m_liveReadyBatches.first();
         const int batchKB = batch.size() / 1024;
         const bool ok = sendXdmaPayload(batch,
@@ -1499,12 +1760,11 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
     return true;
 }
 
-// ----- 子模块：测试执行 -----
-// 发送固定测试包，用于验证 PC->FPGA H2C 通道连通性。
+// ----- 瀛愭ā鍧楋細娴嬭瘯鎵ц -----
+// 鍙戦€佸浐瀹氭祴璇曞寘锛岀敤浜庨獙璇?PC->FPGA H2C 閫氶亾杩為€氭€с€?
 bool Widget::sendXdmaTestPacket()
 {
-    // 4KB 固定模式测试包，用于链路连通性验证。
-    // 头部 [0..3]="XDMA"， [4..7]=序号。
+    // 4KB 鍥哄畾妯″紡娴嬭瘯鍖咃紝鐢ㄤ簬閾捐矾杩為€氭€ч獙璇併€?    // 澶撮儴 [0..3]="XDMA"锛?[4..7]=搴忓彿銆?
     constexpr int packetSize = 4096;
     QByteArray payload(packetSize, '\0');
     BYTE *buffer = reinterpret_cast<BYTE *>(payload.data());
@@ -1527,8 +1787,7 @@ bool Widget::sendXdmaTestPacket()
 
 void Widget::runPacketModuleSelfTest()
 {
-    // 该函数只做纯软件协议自测，不访问 XDMA 设备：
-    // 因此即便未打开硬件，也可以单独验证封包与聚合规则。
+    // 璇ュ嚱鏁板彧鍋氱函杞欢鍗忚鑷祴锛屼笉璁块棶 XDMA 璁惧锛?    // 鍥犳鍗充究鏈墦寮€纭欢锛屼篃鍙互鍗曠嫭楠岃瘉灏佸寘涓庤仛鍚堣鍒欍€?
     QString report;
     const bool ok = VideoPacketBatcher::runSelfTest(&report);
     ui->plainTextEdit->appendPlainText(

@@ -39,6 +39,12 @@ FORMS += \
 INCLUDEPATH += $$PWD/driver
 win32 {
 LIBS += -L$$PWD/driver -lXDMA_MoreB
+msvc {
+    LIBS += strmiids.lib ole32.lib oleaut32.lib uuid.lib
+}
+win32-g++ {
+    LIBS += -lstrmiids -lole32 -loleaut32 -luuid
+}
 }
 
 # 目标部署目录规则（保留 qmake 默认模板结构）。
