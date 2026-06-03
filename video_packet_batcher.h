@@ -69,6 +69,7 @@ public:
     int pendingBytes() const;
     int pendingPayloadBytes() const;
     void discardPendingPayloadBytes();
+    void clear();
 
     // 仅执行协议封包，不参与批次聚合缓存。
     // 返回值是连续的 1024B 定长包流，可直接发送到 XDMA。

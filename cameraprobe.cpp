@@ -134,6 +134,47 @@ QString readPropertyBagString(IPropertyBag *bag, const wchar_t *propertyName)
 }
 #endif
 
+bool isExactPositiveFrameRate(double minFps, double maxFps)
+{
+    if (minFps <= 0.0 || maxFps <= 0.0) {
+        return false;
+    }
+
+    const double delta = minFps - maxFps;
+    return delta > -0.001 && delta < 0.001;
+}
+
+QCameraViewfinderSettings makeDriverRequestSettings(const QCameraViewfinderSettings &source)
+{
+    QCameraViewfinderSettings request;
+
+    const QSize resolution = source.resolution();
+    if (resolution.width() > 0 && resolution.height() > 0) {
+        request.setResolution(resolution);
+    }
+
+    if (source.pixelFormat() != QVideoFrame::Format_Invalid) {
+        request.setPixelFormat(source.pixelFormat());
+    }
+
+    if (isExactPositiveFrameRate(source.minimumFrameRate(),
+                                 source.maximumFrameRate())) {
+        request.setMinimumFrameRate(source.minimumFrameRate());
+        request.setMaximumFrameRate(source.maximumFrameRate());
+    }
+
+    return request;
+}
+
+bool hasDriverRequestSettings(const QCameraViewfinderSettings &settings)
+{
+    const QSize resolution = settings.resolution();
+    return (resolution.width() > 0 && resolution.height() > 0) ||
+            settings.pixelFormat() != QVideoFrame::Format_Invalid ||
+            settings.minimumFrameRate() > 0.0 ||
+            settings.maximumFrameRate() > 0.0;
+}
+
 } // namespace
 
 
@@ -224,8 +265,6 @@ bool FrameGrabSurface::present(const QVideoFrame &frame)
     const int loopPlaneCount = planeCount > 0 ? planeCount : 1;
     const int mappedBytesTotal = copy.mappedBytes();
     for (int p = 0; p < loopPlaneCount; ++p) {
-        // Qt 5.12 下 mappedBytes() 只有总大小接口，
-        // 因此仅记录 plane0 的总映射大小，其它 plane 记为 -1。
         const int bytesPerLine = copy.bytesPerLine(p);
 
         out.bytesPerLines.push_back(bytesPerLine);
@@ -538,11 +577,12 @@ bool CameraProbe::enumerateAllModesViaDirectShow(QStringList &lines, QString *re
                         maxFps = fps;
                     }
 
-                    lines << QString("  mode #%1: %2x%3 format=%4 fps[%5,%6]")
+                    lines << QString("  mode #%1: %2x%3 format=%4 fps=%5 range[%6,%7]")
                              .arg(capIndex)
                              .arg(width)
                              .arg(qAbs(height))
                              .arg(formatLabel)
+                             .arg(fps, 0, 'f', 3)
                              .arg(minFps, 0, 'f', 3)
                              .arg(maxFps, 0, 'f', 3);
                     ++modeCount;
@@ -779,21 +819,27 @@ bool CameraProbe::startSingleFrameCapture(const CameraModeInfo &mode)
     m_camera->setCaptureMode(QCamera::CaptureViewfinder);
     m_camera->setViewfinder(m_surface);
 
-    const QSize resolution = mode.settings.resolution();
-    const bool hasResolution = resolution.width() > 0 && resolution.height() > 0;
-    const bool hasPixelFormat = mode.settings.pixelFormat() != QVideoFrame::Format_Invalid;
-    const bool hasFrameRate = mode.settings.minimumFrameRate() > 0.0
-            || mode.settings.maximumFrameRate() > 0.0;
-
-    if (hasResolution || hasPixelFormat || hasFrameRate) {
+    const QCameraViewfinderSettings requestSettings =
+            makeDriverRequestSettings(mode.settings);
+    if (hasDriverRequestSettings(requestSettings)) {
         // 仅在请求参数有效时设置，避免向驱动写入无意义配置。
-        m_camera->setViewfinderSettings(mode.settings);
+        m_camera->setViewfinderSettings(requestSettings);
         emit logMessage(QStringLiteral("Requested mode: resolution=%1x%2, format=%3, fps=[%4,%5]")
-                        .arg(mode.settings.resolution().width())
-                        .arg(mode.settings.resolution().height())
-                        .arg(pixelFormatToString(mode.settings.pixelFormat()))
-                        .arg(mode.settings.minimumFrameRate())
-                        .arg(mode.settings.maximumFrameRate()));
+                        .arg(requestSettings.resolution().width())
+                        .arg(requestSettings.resolution().height())
+                        .arg(pixelFormatToString(requestSettings.pixelFormat()))
+                        .arg(requestSettings.minimumFrameRate())
+                        .arg(requestSettings.maximumFrameRate()));
+
+        const bool selectedHasFps = mode.settings.minimumFrameRate() > 0.0 ||
+                mode.settings.maximumFrameRate() > 0.0;
+        const bool requestedHasFps = requestSettings.minimumFrameRate() > 0.0 ||
+                requestSettings.maximumFrameRate() > 0.0;
+        if (selectedHasFps && !requestedHasFps) {
+            emit logMessage(QStringLiteral("Listed fps range [%1,%2] is left to the driver; Qt expects a concrete frame rate.")
+                            .arg(mode.settings.minimumFrameRate())
+                            .arg(mode.settings.maximumFrameRate()));
+        }
     } else {
         emit logMessage(QStringLiteral("No explicit viewfinder params are set. Using camera default preview format."));
     }

@@ -14,6 +14,7 @@
 #include "cameraprobe.h"
 #include "video_packet_batcher.h"
 
+class DirectShowPreviewSession;
 class QSpinBox;
 class QLineEdit;
 class QLabel;
@@ -51,7 +52,6 @@ private slots:
     void onProbeFailed(const QString &reason);
 
     // ===== 鍥炶皟妲斤細棰勮閾捐矾 =====
-    void onPreviewCameraError(QCamera::Error error);
     void onRawFrameAvailable(const CapturedFrame &frame);
 
 private:
@@ -71,12 +71,13 @@ private:
     void refreshModeCombo();
     void applySelectedModeFromCombo();
     void stopLiveVideoSending(const QString &reason = QString());
+    void clearLiveVideoBuffers();
     bool selectedModeSupportsLiveStreaming(QString *reason = nullptr) const;
-    bool findStrictLiveYuyvMode(CameraModeInfo &outMode, QString *report) const;
+    bool findDefaultLiveYuyvMode(CameraModeInfo &outMode, QString *report) const;
     bool normalizeLiveYuyvFrame(const CapturedFrame &frame,
+                                const QSize &expectedResolution,
                                 QByteArray &payload,
                                 QString *reason) const;
-    void updateRawPreview(const CapturedFrame &frame);
 
     // ===== 妯″潡锛氳棰戜笟鍔″彂閫侊紙灏佸寘 + 鑱氬悎锛?=====
     // 瑙嗛鍙戦€佷笓鐢ㄥ叆鍙ｏ細
@@ -120,14 +121,14 @@ private:
     CameraProbe *m_probe = nullptr;
 
     // 瀹炴椂棰勮閾捐矾瀵硅薄銆?
-    QCamera *m_previewCamera = nullptr;
-    QLabel *m_previewLabel = nullptr;
-    RawFrameSurface *m_rawFrameSurface = nullptr;
+    DirectShowPreviewSession *m_directShowPreview = nullptr;
+    QWidget *m_previewWidget = nullptr;
     QComboBox *m_modeCombo = nullptr;
     QPushButton *m_applyModeBtn = nullptr;
     QList<CameraModeInfo> m_availableModes;
     bool m_useManualPreviewMode = false;
     CameraModeInfo m_manualPreviewMode;
+    bool m_waitingPreviewSingleFrame = false;
 
     // 鎶撳彇鍗曞抚鍓嶄細鏆傚仠棰勮锛屾姄鍙栫粨鏉熷悗鏍规嵁璇ユ爣璁版仮澶嶃€?
     bool m_restartPreviewAfterCapture = false;

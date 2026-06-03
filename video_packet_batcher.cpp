@@ -60,6 +60,12 @@ void VideoPacketBatcher::discardPendingPayloadBytes()
     m_payloadCache.clear();
 }
 
+void VideoPacketBatcher::clear()
+{
+    m_batchCache.clear();
+    m_payloadCache.clear();
+}
+
 QByteArray VideoPacketBatcher::buildPacketStream(const QByteArray &videoPayload,
                                                  int *packetCount,
                                                  int minPacketCount) const
@@ -215,6 +221,12 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
         errors << QString("stream should not emit batch, actual=%1")
                   .arg(streamBatches.size());
     }
+    streamBatcher.clear();
+    if (streamBatcher.pendingBytes() != 0 || streamBatcher.pendingPayloadBytes() != 0) {
+        errors << QString("clear cache mismatch, pending=%1 payloadTail=%2")
+                  .arg(streamBatcher.pendingBytes())
+                  .arg(streamBatcher.pendingPayloadBytes());
+    }
 
     // 样本 1.1：仅验证“完整 payload”封包格式（length 固定 0x0400）。
     VideoPacketBatcher packetizer(route);
@@ -290,7 +302,7 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
     const bool ok = errors.isEmpty();
     if (report) {
         if (ok) {
-            *report = QStringLiteral("PASS packet-format and 1MiB aggregation");
+            *report = QStringLiteral("PASS packet-format, cache clear, and 1MiB aggregation");
         } else {
             *report = QStringLiteral("FAIL: ") + errors.join(QStringLiteral("; "));
         }

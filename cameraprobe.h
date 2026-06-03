@@ -27,6 +27,10 @@ struct CameraModeInfo
     QString description;
     QString deviceName;
     QCameraViewfinderSettings settings;
+    bool directShowMode = false;
+    QString directShowDevicePath;
+    QString directShowFormatTag;
+    double directShowFps = 0.0;
 };
 
 // 单帧抓取结果：

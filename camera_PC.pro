@@ -23,12 +23,14 @@ win32-g++ {
 
 SOURCES += \
     cameraprobe.cpp \
+    directshowpreviewsession.cpp \
     main.cpp \
     video_packet_batcher.cpp \
     widget.cpp
 
 HEADERS += \
     cameraprobe.h \
+    directshowpreviewsession.h \
     video_packet_batcher.h \
     widget.h
 
@@ -40,10 +42,10 @@ INCLUDEPATH += $$PWD/driver
 win32 {
 LIBS += -L$$PWD/driver -lXDMA_MoreB
 msvc {
-    LIBS += strmiids.lib ole32.lib oleaut32.lib uuid.lib
+    LIBS += strmiids.lib ole32.lib oleaut32.lib uuid.lib d3d9.lib evr.lib mfplat.lib mfuuid.lib
 }
 win32-g++ {
-    LIBS += -lstrmiids -lole32 -loleaut32 -luuid
+    LIBS += -lstrmiids -lole32 -loleaut32 -luuid -ld3d9 -levr -lmfplat -lmfuuid
 }
 }
 

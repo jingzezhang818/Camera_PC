@@ -17,6 +17,7 @@ debug/
 release/
 debug/
 .ui/*.h
+driver/linux_xdma/build/
 
 # Generated files
 *.raw
