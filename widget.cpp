@@ -564,7 +564,7 @@ void Widget::initializeTransferControls()
     QLabel *throttleLabel = new QLabel(
                 QString::fromWCharArray(L"\u8282\u6D41\u95F4\u9694(ms):"), panel);
     m_throttleSpin = new QSpinBox(panel);
-    m_throttleSpin->setRange(1, 1000);
+    m_throttleSpin->setRange(0, 1000);
     m_throttleSpin->setSingleStep(1);
     m_throttleSpin->setValue(static_cast<int>(m_liveStreamThrottleMs));
 
@@ -585,7 +585,7 @@ void Widget::initializeTransferControls()
     connect(m_throttleSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int value) {
         // 杩愯鏃舵洿鏂拌妭娴佸弬鏁帮紝鏃犻渶閲嶅惎棰勮鎴栭噸寤虹浉鏈恒€?
-        m_liveStreamThrottleMs = qMax<qint64>(1, value);
+        m_liveStreamThrottleMs = qMax<qint64>(0, value);
         if (ui && ui->plainTextEdit) {
             ui->plainTextEdit->appendPlainText(
                         QString("[CFG] Live throttle interval set to %1 ms")
@@ -1403,7 +1403,9 @@ void Widget::onRawFrameAvailable(const CapturedFrame &frame)
     }
 
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    if (m_lastLiveSendMs > 0 && (nowMs - m_lastLiveSendMs) < m_liveStreamThrottleMs) {
+    if (m_liveStreamThrottleMs > 0
+            && m_lastLiveSendMs > 0
+            && (nowMs - m_lastLiveSendMs) < m_liveStreamThrottleMs) {
         return;
     }
 
