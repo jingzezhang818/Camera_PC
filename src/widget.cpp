@@ -10,12 +10,14 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QSpinBox>
+#include <QComboBox>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
+#include <QSet>
 #include <QVector>
 #include <vector>
 #include <cstring>
-#include <cmath>
 
 // XDMA 辅助 API，由厂商 DLL 导出。
 #include "xdmaDLL_public_linux.h"
@@ -109,178 +111,89 @@ bool yuyvToRgbImage(const CapturedFrame &frame, QImage &outImage)
     return true;
 }
 
-constexpr int kTargetPreviewWidth = 640;
-constexpr int kTargetPreviewHeight = 360;
-constexpr qreal kTargetPreviewFps = 30.0;
-constexpr qreal kFpsTolerance = 0.6;
+constexpr int kYuyvBytesPerPixel = 2;
 
-bool hasValidResolution(const QCameraViewfinderSettings &settings)
+bool isExactPositiveFrameRate(double minFps, double maxFps)
 {
-    const QSize resolution = settings.resolution();
-    return resolution.width() > 0 && resolution.height() > 0;
-}
-
-bool fpsRangeContains(const QCameraViewfinderSettings &settings, qreal targetFps)
-{
-    const qreal minFps = settings.minimumFrameRate();
-    const qreal maxFps = settings.maximumFrameRate();
-    if (minFps <= 0.0 && maxFps <= 0.0) {
-        return true;
-    }
-    if (minFps > 0.0 && maxFps > 0.0) {
-        return targetFps + kFpsTolerance >= minFps
-                && targetFps - kFpsTolerance <= maxFps;
-    }
-
-    const qreal singleFps = qMax(minFps, maxFps);
-    return std::abs(singleFps - targetFps) <= kFpsTolerance;
-}
-
-qreal fpsDistance(const QCameraViewfinderSettings &settings, qreal targetFps)
-{
-    if (fpsRangeContains(settings, targetFps)) {
-        return 0.0;
-    }
-
-    const qreal minFps = settings.minimumFrameRate();
-    const qreal maxFps = settings.maximumFrameRate();
-    if (minFps > 0.0 && targetFps < minFps) {
-        return minFps - targetFps;
-    }
-    if (maxFps > 0.0 && targetFps > maxFps) {
-        return targetFps - maxFps;
-    }
-
-    const qreal singleFps = qMax(minFps, maxFps);
-    if (singleFps > 0.0) {
-        return std::abs(singleFps - targetFps);
-    }
-
-    return 0.0;
-}
-
-int pixelFormatScore(QVideoFrame::PixelFormat fmt)
-{
-    switch (fmt) {
-    case QVideoFrame::Format_YUYV:    return 60;
-    case QVideoFrame::Format_UYVY:    return 55;
-    case QVideoFrame::Format_NV12:    return 50;
-    case QVideoFrame::Format_NV21:    return 48;
-    case QVideoFrame::Format_YUV420P: return 45;
-    case QVideoFrame::Format_YV12:    return 43;
-    case QVideoFrame::Format_RGB24:   return 35;
-    case QVideoFrame::Format_RGB32:   return 33;
-    case QVideoFrame::Format_ARGB32:  return 31;
-    case QVideoFrame::Format_BGR24:   return 29;
-    case QVideoFrame::Format_BGR32:   return 27;
-    case QVideoFrame::Format_Jpeg:    return 12;
-    case QVideoFrame::Format_Invalid: return -1000;
-    default:                          return 20;
-    }
-}
-
-bool chooseFixedPreviewMode(const QCameraInfo &cameraInfo,
-                            CameraModeInfo &outMode,
-                            QString *reason = nullptr)
-{
-    const QList<CameraModeInfo> modes = CameraProbe::enumerateAllModes();
-    bool found = false;
-
-    for (const CameraModeInfo &candidate : modes) {
-        if (candidate.deviceName != cameraInfo.deviceName()) {
-            continue;
-        }
-        if (!hasValidResolution(candidate.settings)) {
-            continue;
-        }
-        if (candidate.settings.pixelFormat() == QVideoFrame::Format_Invalid) {
-            continue;
-        }
-
-        if (!found) {
-            outMode = candidate;
-            found = true;
-            continue;
-        }
-
-        const QCameraViewfinderSettings &a = candidate.settings;
-        const QCameraViewfinderSettings &b = outMode.settings;
-        const QSize ra = a.resolution();
-        const QSize rb = b.resolution();
-
-        const bool aExactRes = ra.width() == kTargetPreviewWidth
-                && ra.height() == kTargetPreviewHeight;
-        const bool bExactRes = rb.width() == kTargetPreviewWidth
-                && rb.height() == kTargetPreviewHeight;
-        if (aExactRes != bExactRes) {
-            if (aExactRes) {
-                outMode = candidate;
-            }
-            continue;
-        }
-
-        const bool aFpsOk = fpsRangeContains(a, kTargetPreviewFps);
-        const bool bFpsOk = fpsRangeContains(b, kTargetPreviewFps);
-        if (aFpsOk != bFpsOk) {
-            if (aFpsOk) {
-                outMode = candidate;
-            }
-            continue;
-        }
-
-        const int aResDelta = std::abs(ra.width() - kTargetPreviewWidth)
-                + std::abs(ra.height() - kTargetPreviewHeight);
-        const int bResDelta = std::abs(rb.width() - kTargetPreviewWidth)
-                + std::abs(rb.height() - kTargetPreviewHeight);
-        if (aResDelta != bResDelta) {
-            if (aResDelta < bResDelta) {
-                outMode = candidate;
-            }
-            continue;
-        }
-
-        const qreal aFpsDelta = fpsDistance(a, kTargetPreviewFps);
-        const qreal bFpsDelta = fpsDistance(b, kTargetPreviewFps);
-        if (std::abs(aFpsDelta - bFpsDelta) > 0.001) {
-            if (aFpsDelta < bFpsDelta) {
-                outMode = candidate;
-            }
-            continue;
-        }
-
-        const int aFmtScore = pixelFormatScore(a.pixelFormat());
-        const int bFmtScore = pixelFormatScore(b.pixelFormat());
-        if (aFmtScore != bFmtScore) {
-            if (aFmtScore > bFmtScore) {
-                outMode = candidate;
-            }
-            continue;
-        }
-
-        const qint64 aArea = static_cast<qint64>(ra.width()) * ra.height();
-        const qint64 bArea = static_cast<qint64>(rb.width()) * rb.height();
-        if (aArea > bArea) {
-            outMode = candidate;
-        }
-    }
-
-    if (!found) {
-        if (reason) {
-            *reason = QStringLiteral("No explicit viewfinder modes were exposed by the driver for this camera.");
-        }
+    if (minFps <= 0.0 || maxFps <= 0.0) {
         return false;
     }
 
-    if (reason) {
-        const QSize r = outMode.settings.resolution();
-        *reason = QString("selected mode: %1x%2 %3 fps[%4,%5]")
-                .arg(r.width())
-                .arg(r.height())
-                .arg(CameraProbe::pixelFormatToString(outMode.settings.pixelFormat()))
-                .arg(outMode.settings.minimumFrameRate(), 0, 'f', 2)
-                .arg(outMode.settings.maximumFrameRate(), 0, 'f', 2);
+    const double delta = minFps - maxFps;
+    return delta > -0.001 && delta < 0.001;
+}
+
+bool isValidYuyvMode(const CameraModeInfo &mode)
+{
+    const QSize resolution = mode.settings.resolution();
+    return mode.settings.pixelFormat() == QVideoFrame::Format_YUYV &&
+            resolution.width() > 0 &&
+            resolution.height() > 0;
+}
+
+int firstYuyvModeIndex(const QList<CameraModeInfo> &modes)
+{
+    for (int i = 0; i < modes.size(); ++i) {
+        if (isValidYuyvMode(modes[i])) {
+            return i;
+        }
     }
-    return true;
+    return -1;
+}
+
+QString modeToComboText(const CameraModeInfo &mode)
+{
+    const QSize resolution = mode.settings.resolution();
+    const QString prefix = QString("%1x%2 | %3 | ")
+            .arg(resolution.width())
+            .arg(resolution.height())
+            .arg(CameraProbe::pixelFormatToString(mode.settings.pixelFormat()));
+
+    if (isExactPositiveFrameRate(mode.settings.minimumFrameRate(),
+                                 mode.settings.maximumFrameRate())) {
+        return prefix + QString("fps=%1")
+                .arg(mode.settings.maximumFrameRate(), 0, 'f', 3);
+    }
+
+    if (mode.settings.minimumFrameRate() > 0.0 ||
+        mode.settings.maximumFrameRate() > 0.0) {
+        return prefix + QString("fps[%1,%2]")
+                .arg(mode.settings.minimumFrameRate(), 0, 'f', 3)
+                .arg(mode.settings.maximumFrameRate(), 0, 'f', 3);
+    }
+
+    return prefix + QStringLiteral("fps=driver");
+}
+
+QCameraViewfinderSettings makeDriverRequestSettings(const QCameraViewfinderSettings &source)
+{
+    QCameraViewfinderSettings request;
+
+    const QSize resolution = source.resolution();
+    if (resolution.width() > 0 && resolution.height() > 0) {
+        request.setResolution(resolution);
+    }
+
+    if (source.pixelFormat() != QVideoFrame::Format_Invalid) {
+        request.setPixelFormat(source.pixelFormat());
+    }
+
+    if (isExactPositiveFrameRate(source.minimumFrameRate(),
+                                 source.maximumFrameRate())) {
+        request.setMinimumFrameRate(source.minimumFrameRate());
+        request.setMaximumFrameRate(source.maximumFrameRate());
+    }
+
+    return request;
+}
+
+bool hasDriverRequestSettings(const QCameraViewfinderSettings &settings)
+{
+    const QSize resolution = settings.resolution();
+    return (resolution.width() > 0 && resolution.height() > 0) ||
+            settings.pixelFormat() != QVideoFrame::Format_Invalid ||
+            settings.minimumFrameRate() > 0.0 ||
+            settings.maximumFrameRate() > 0.0;
 }
 
 } // 匿名命名空间
@@ -328,6 +241,7 @@ void Widget::initializePreview()
     m_viewfinder->setAspectRatioMode(Qt::KeepAspectRatio);
 
     ui->verticalLayout->insertWidget(1, m_viewfinder, 1);
+    initializeModeControls();
     initializeTransferControls();
     initializeAxiLiteControls();
 
@@ -335,6 +249,139 @@ void Widget::initializePreview()
     connect(m_videoProbe, &QVideoProbe::videoFrameProbed,
             this, &Widget::onPreviewFrameProbed);
 
+    startPreview();
+}
+
+void Widget::initializeModeControls()
+{
+    QWidget *panel = new QWidget(this);
+    panel->setObjectName("cameraModePanel");
+
+    QHBoxLayout *row = new QHBoxLayout(panel);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(8);
+
+    QLabel *modeLabel = new QLabel(QString::fromWCharArray(L"\u6444\u50CF\u5934\u6A21\u5F0F:"), panel);
+    m_modeCombo = new QComboBox(panel);
+    m_modeCombo->setMinimumWidth(360);
+    m_applyModeBtn = new QPushButton(QString::fromWCharArray(L"\u5E94\u7528\u6A21\u5F0F"), panel);
+
+    row->addWidget(modeLabel);
+    row->addWidget(m_modeCombo, 1);
+    row->addWidget(m_applyModeBtn);
+
+    connect(m_applyModeBtn, &QPushButton::clicked,
+            this, &Widget::applySelectedModeFromCombo);
+    connect(m_modeCombo, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) {
+        applySelectedModeFromCombo();
+    });
+
+    ui->verticalLayout->insertWidget(2, panel);
+    refreshModeCombo();
+}
+
+void Widget::refreshModeCombo()
+{
+    if (!m_modeCombo) {
+        return;
+    }
+
+    const QString previousText = m_modeCombo->currentText();
+    const QSignalBlocker blocker(m_modeCombo);
+    m_modeCombo->clear();
+    m_availableModes.clear();
+
+    const QList<CameraModeInfo> modes = CameraProbe::enumerateAllModes();
+    QSet<QString> dedup;
+    for (const CameraModeInfo &mode : modes) {
+        const QSize resolution = mode.settings.resolution();
+        const bool hasResolution = resolution.width() > 0 && resolution.height() > 0;
+        const bool hasFormat = mode.settings.pixelFormat() != QVideoFrame::Format_Invalid;
+        const bool hasFps = mode.settings.minimumFrameRate() > 0.0 ||
+                mode.settings.maximumFrameRate() > 0.0;
+        if (!hasResolution && !hasFormat && !hasFps) {
+            continue;
+        }
+
+        const QString key = QString("%1|%2x%3|%4|%5|%6")
+                .arg(mode.cameraIndex)
+                .arg(resolution.width())
+                .arg(resolution.height())
+                .arg(static_cast<int>(mode.settings.pixelFormat()))
+                .arg(mode.settings.minimumFrameRate(), 0, 'f', 3)
+                .arg(mode.settings.maximumFrameRate(), 0, 'f', 3);
+        if (dedup.contains(key)) {
+            continue;
+        }
+        dedup.insert(key);
+        m_availableModes.push_back(mode);
+    }
+
+    for (const CameraModeInfo &mode : m_availableModes) {
+        m_modeCombo->addItem(modeToComboText(mode));
+    }
+
+    if (m_modeCombo->count() == 0) {
+        m_modeCombo->addItem(QStringLiteral("No explicit camera mode available"));
+        m_modeCombo->setEnabled(false);
+        m_useManualPreviewMode = false;
+        if (m_applyModeBtn) {
+            m_applyModeBtn->setEnabled(false);
+        }
+        return;
+    }
+
+    m_modeCombo->setEnabled(true);
+    if (m_applyModeBtn) {
+        m_applyModeBtn->setEnabled(true);
+    }
+
+    int targetIndex = firstYuyvModeIndex(m_availableModes);
+    if (targetIndex < 0) {
+        targetIndex = 0;
+    }
+    if (!previousText.isEmpty()) {
+        const int found = m_modeCombo->findText(previousText);
+        if (found >= 0) {
+            targetIndex = found;
+        }
+    }
+
+    m_modeCombo->setCurrentIndex(targetIndex);
+    if (targetIndex >= 0 && targetIndex < m_availableModes.size()) {
+        m_manualPreviewMode = m_availableModes[targetIndex];
+        m_useManualPreviewMode = true;
+    }
+}
+
+void Widget::applySelectedModeFromCombo()
+{
+    if (!m_modeCombo || m_availableModes.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[WARN] No selectable camera mode is available."));
+        return;
+    }
+
+    const int index = m_modeCombo->currentIndex();
+    if (index < 0 || index >= m_availableModes.size()) {
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[WARN] Please select a valid camera mode."));
+        return;
+    }
+
+    if (m_liveVideoSending) {
+        stopLiveVideoSending(QStringLiteral("camera mode switch"));
+    }
+    clearLiveVideoBuffers();
+
+    m_manualPreviewMode = m_availableModes[index];
+    m_useManualPreviewMode = true;
+    ui->plainTextEdit->appendPlainText(
+                QString("[INFO] Applying mode: %1")
+                .arg(modeToComboText(m_manualPreviewMode)));
+
+    stopPreview();
     startPreview();
 }
 
@@ -406,7 +453,7 @@ void Widget::initializeTransferControls()
         }
     });
 
-    ui->verticalLayout->insertWidget(2, panel);
+    ui->verticalLayout->insertWidget(3, panel);
 
     // 让封包聚合模块与 UI 初始值保持一致。
     m_videoPacketBatcher.setBatchBytes(m_xdmaChunkBytes);
@@ -518,7 +565,7 @@ void Widget::initializeAxiLiteControls()
                     .arg(toHex32(value)));
     });
 
-    ui->verticalLayout->insertWidget(3, panel);
+    ui->verticalLayout->insertWidget(4, panel);
 }
 
 // 启动实时预览。
@@ -539,7 +586,21 @@ void Widget::startPreview()
         return;
     }
 
-    const QCameraInfo info = cameras.first();
+    CameraModeInfo selected;
+    if (m_useManualPreviewMode) {
+        selected = m_manualPreviewMode;
+    }
+
+    QCameraInfo info;
+    if (selected.cameraIndex >= 0 && selected.cameraIndex < cameras.size()) {
+        info = cameras[selected.cameraIndex];
+    } else {
+        info = cameras.first();
+        selected.cameraIndex = 0;
+        selected.cameraInfo = info;
+        selected.description = info.description();
+        selected.deviceName = info.deviceName();
+    }
 
     qInfo().noquote() << QString("[CAMERA] selected preview device: desc=%1, dev=%2")
                          .arg(info.description())
@@ -553,49 +614,21 @@ void Widget::startPreview()
 
     m_previewCamera = new QCamera(info, this);
     m_previewCamera->setCaptureMode(QCamera::CaptureViewfinder);
+
+    const QCameraViewfinderSettings request = makeDriverRequestSettings(selected.settings);
+    if (hasDriverRequestSettings(request)) {
+        m_previewCamera->setViewfinderSettings(request);
+    }
+
     m_previewCamera->setViewfinder(m_viewfinder);
 
-    QCameraViewfinderSettings previewSettings;
-    CameraModeInfo chosenMode;
-    QString chooseReason;
-    const bool hasChosenMode = chooseFixedPreviewMode(info, chosenMode, &chooseReason);
-    bool chosenExactResolution = false;
-    if (hasChosenMode) {
-        previewSettings = chosenMode.settings;
-        const QSize chosenRes = chosenMode.settings.resolution();
-        chosenExactResolution = chosenRes.width() == kTargetPreviewWidth
-                && chosenRes.height() == kTargetPreviewHeight;
-        if (!chosenExactResolution) {
-            // 避免把“其它分辨率下有效”的像素格式硬绑到 640x360。
-            previewSettings.setPixelFormat(QVideoFrame::Format_Invalid);
-        }
-    } else {
-        ui->plainTextEdit->appendPlainText(
-                    QStringLiteral("[WARN] Camera mode list unavailable. Will request fixed preview profile directly."));
-        if (!chooseReason.isEmpty()) {
-            ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + chooseReason);
-        }
-    }
-
-    // 固定请求 640x360 @ 30fps，若驱动不支持会回退到最接近模式。
-    previewSettings.setResolution(kTargetPreviewWidth, kTargetPreviewHeight);
-    previewSettings.setMinimumFrameRate(kTargetPreviewFps);
-    previewSettings.setMaximumFrameRate(kTargetPreviewFps);
-    m_previewCamera->setViewfinderSettings(previewSettings);
-
-    if (hasChosenMode && !chooseReason.isEmpty()) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] Preview candidate: ") + chooseReason);
-        if (!chosenExactResolution) {
-            ui->plainTextEdit->appendPlainText(
-                        QStringLiteral("[WARN] Exact 640x360 mode was not enumerated. Driver will negotiate the closest mode."));
-        }
-    }
     ui->plainTextEdit->appendPlainText(
-                QString("[INFO] Preview request profile: %1x%2 @ %3 fps, format=%4")
-                .arg(kTargetPreviewWidth)
-                .arg(kTargetPreviewHeight)
-                .arg(kTargetPreviewFps, 0, 'f', 1)
-                .arg(CameraProbe::pixelFormatToString(previewSettings.pixelFormat())));
+                QString("[INFO] Preview request profile: %1x%2 %3 fps=[%4,%5]")
+                .arg(request.resolution().width())
+                .arg(request.resolution().height())
+                .arg(CameraProbe::pixelFormatToString(request.pixelFormat()))
+                .arg(request.minimumFrameRate())
+                .arg(request.maximumFrameRate()));
 
     if (m_videoProbe) {
         if (!m_videoProbe->setSource(m_previewCamera)) {
@@ -660,6 +693,205 @@ void Widget::stopPreview()
     m_previewCamera = nullptr;
 }
 
+void Widget::clearLiveVideoBuffers()
+{
+    m_videoPacketBatcher.clear();
+    m_liveReadyBatches.clear();
+}
+
+void Widget::stopLiveVideoSending(const QString &reason)
+{
+    if (!m_liveVideoSending) {
+        return;
+    }
+
+    const int droppedPayloadBytes = m_videoPacketBatcher.pendingPayloadBytes();
+
+    int queuedBatchBytes = 0;
+    for (const QByteArray &batch : m_liveReadyBatches) {
+        queuedBatchBytes += batch.size();
+    }
+    const int cachedNotSentBytes = m_videoPacketBatcher.pendingBytes() + queuedBatchBytes;
+
+    const qint64 elapsedMs = m_liveSendStartMs > 0
+            ? qMax<qint64>(0, QDateTime::currentMSecsSinceEpoch() - m_liveSendStartMs)
+            : 0;
+
+    m_liveVideoSending = false;
+    m_liveSendStartMs = 0;
+    ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
+
+    const QString suffix = reason.isEmpty()
+            ? QString()
+            : QStringLiteral(", reason=%1").arg(reason);
+    ui->plainTextEdit->appendPlainText(
+                QString("[XDMA] Live camera streaming stopped. duration=%1 ms, sent batches=%2, cached-not-sent=%3 bytes, dropped-tail=%4 bytes%5")
+                .arg(elapsedMs)
+                .arg(m_liveSentBatches)
+                .arg(cachedNotSentBytes)
+                .arg(droppedPayloadBytes)
+                .arg(suffix));
+
+    clearLiveVideoBuffers();
+}
+
+bool Widget::selectedModeSupportsLiveStreaming(QString *reason) const
+{
+    CameraModeInfo mode;
+    QString modeReport;
+    if (m_useManualPreviewMode) {
+        mode = m_manualPreviewMode;
+    } else if (!findDefaultLiveYuyvMode(mode, &modeReport)) {
+        if (reason) {
+            *reason = modeReport;
+        }
+        return false;
+    }
+
+    if (isValidYuyvMode(mode)) {
+        return true;
+    }
+
+    const QSize resolution = mode.settings.resolution();
+    const QVideoFrame::PixelFormat format = mode.settings.pixelFormat();
+    if (reason) {
+        *reason = QString("Live XDMA streaming supports YUYV raw only, current mode is %1x%2 %3.")
+                .arg(resolution.width())
+                .arg(resolution.height())
+                .arg(CameraProbe::pixelFormatToString(format));
+    }
+    return false;
+}
+
+bool Widget::findDefaultLiveYuyvMode(CameraModeInfo &outMode, QString *report) const
+{
+    QList<CameraModeInfo> modes = m_availableModes;
+    if (modes.isEmpty()) {
+        modes = CameraProbe::enumerateYuy2Modes();
+    }
+    QStringList available;
+
+    for (const CameraModeInfo &mode : modes) {
+        const QSize resolution = mode.settings.resolution();
+        if (mode.settings.pixelFormat() == QVideoFrame::Format_YUYV) {
+            available << QString("%1 dev=%2 %3x%4 fps=[%5,%6]")
+                         .arg(mode.description)
+                         .arg(mode.deviceName)
+                         .arg(resolution.width())
+                         .arg(resolution.height())
+                         .arg(mode.settings.minimumFrameRate())
+                         .arg(mode.settings.maximumFrameRate());
+        }
+
+        if (isValidYuyvMode(mode)) {
+            outMode = mode;
+            if (report) {
+                *report = QString("Default YUYV mode selected: %1x%2 fps=[%3,%4].")
+                        .arg(resolution.width())
+                        .arg(resolution.height())
+                        .arg(mode.settings.minimumFrameRate())
+                        .arg(mode.settings.maximumFrameRate());
+            }
+            return true;
+        }
+    }
+
+    if (report) {
+        if (available.isEmpty()) {
+            *report = QStringLiteral("No valid YUYV modes were reported by the camera driver.");
+        } else {
+            *report = QStringLiteral("Available YUYV modes: ") + available.join(QStringLiteral(" | "));
+        }
+    }
+
+    return false;
+}
+
+bool Widget::normalizeLiveYuyvFrame(const CapturedFrame &frame,
+                                    const QSize &expectedResolution,
+                                    QByteArray &payload,
+                                    QString *reason) const
+{
+    payload.clear();
+
+    const int expectedWidth = expectedResolution.width();
+    const int expectedHeight = expectedResolution.height();
+    if (expectedWidth <= 0 || expectedHeight <= 0) {
+        if (reason) {
+            *reason = QString("invalid expected YUYV resolution=%1x%2")
+                    .arg(expectedWidth)
+                    .arg(expectedHeight);
+        }
+        return false;
+    }
+
+    if (frame.pixelFormat != QVideoFrame::Format_YUYV) {
+        if (reason) {
+            *reason = QString("actualFormat=%1, expected=YUYV")
+                    .arg(CameraProbe::pixelFormatToString(frame.pixelFormat));
+        }
+        return false;
+    }
+
+    if (frame.resolution != expectedResolution) {
+        if (reason) {
+            *reason = QString("actualSize=%1x%2, expected=%3x%4")
+                    .arg(frame.resolution.width())
+                    .arg(frame.resolution.height())
+                    .arg(expectedWidth)
+                    .arg(expectedHeight);
+        }
+        return false;
+    }
+
+    const int expectedLineBytes = expectedWidth * kYuyvBytesPerPixel;
+    const int expectedFrameBytes = expectedLineBytes * expectedHeight;
+    const int bytesPerLine = (!frame.bytesPerLines.isEmpty() && frame.bytesPerLines.first() > 0)
+            ? frame.bytesPerLines.first()
+            : expectedLineBytes;
+
+    if (bytesPerLine < expectedLineBytes) {
+        if (reason) {
+            *reason = QString("bytesPerLine=%1, expected at least %2")
+                    .arg(bytesPerLine)
+                    .arg(expectedLineBytes);
+        }
+        return false;
+    }
+
+    const int requiredMappedBytes = bytesPerLine * expectedHeight;
+    if (frame.payload.size() < requiredMappedBytes) {
+        if (reason) {
+            *reason = QString("payload=%1B, required=%2B")
+                    .arg(frame.payload.size())
+                    .arg(requiredMappedBytes);
+        }
+        return false;
+    }
+
+    if (bytesPerLine == expectedLineBytes) {
+        payload = frame.payload.left(expectedFrameBytes);
+        return payload.size() == expectedFrameBytes;
+    }
+
+    payload.resize(expectedFrameBytes);
+    const char *src = frame.payload.constData();
+    char *dst = payload.data();
+    for (int y = 0; y < expectedHeight; ++y) {
+        std::memcpy(dst + y * expectedLineBytes,
+                    src + y * bytesPerLine,
+                    expectedLineBytes);
+    }
+
+    ui->plainTextEdit->appendPlainText(
+                QString("[RAW] Normalized stride frame: size=%1x%2, bytesPerLine=%3 -> payload=%4B")
+                .arg(expectedWidth)
+                .arg(expectedHeight)
+                .arg(bytesPerLine)
+                .arg(payload.size()));
+    return true;
+}
+
 // ===== 模块：UI 操作入口（按钮槽）与采集回调 =====
 // 说明：
 // 1) 先放“用户可直接触发”的按钮入口，便于从上到下理解业务流程；
@@ -695,6 +927,8 @@ void Widget::on_btnListModes_clicked()
                              .arg(i)
                              .arg(info.deviceName());
     }
+
+    refreshModeCombo();
 
     const auto modes = CameraProbe::enumerateAllModes();
     QList<CameraModeInfo> validModes;
@@ -754,7 +988,12 @@ void Widget::on_btnGrabOneFrame_clicked()
 
     CameraModeInfo selected;
     QString reason;
-    if (CameraProbe::findPreferredYuy2Mode(kTargetPreviewWidth, kTargetPreviewHeight, selected, &reason)) {
+    if (m_useManualPreviewMode) {
+        selected = m_manualPreviewMode;
+        ui->plainTextEdit->appendPlainText(
+                    QString("[INFO] Single-frame capture uses current UI mode: %1")
+                    .arg(modeToComboText(selected)));
+    } else if (findDefaultLiveYuyvMode(selected, &reason)) {
         ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + reason);
     } else {
         const QCameraInfo info = cameras.first();
@@ -780,6 +1019,9 @@ void Widget::on_btnGrabOneFrame_clicked()
                 .arg(selected.settings.minimumFrameRate())
                 .arg(selected.settings.maximumFrameRate()));
 
+    if (m_liveVideoSending) {
+        stopLiveVideoSending(QStringLiteral("single-frame capture"));
+    }
     stopPreview();
     m_restartPreviewAfterCapture = true;
 
@@ -825,7 +1067,27 @@ void Widget::on_btnSendCapturedFrame_clicked()
         label = QString("saved raw %1").arg(m_lastSavedRawFilePath);
     }
 
-    sendVideoPayloadWithBatching(payload, label, true, true);
+    int packetCount = 0;
+    const QByteArray packetStream =
+            m_videoPacketBatcher.buildPacketStream(payload, &packetCount);
+    if (packetStream.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[ERROR] Packetization failed for cached frame: %1")
+                    .arg(label));
+        return;
+    }
+
+    ui->plainTextEdit->appendPlainText(
+                QString("[PKG][DIRECT] %1 raw=%2B -> packets=%3 (%4B)")
+                .arg(label)
+                .arg(payload.size())
+                .arg(packetCount)
+                .arg(packetStream.size()));
+
+    sendXdmaPayload(packetStream,
+                    QString("%1 [direct packet stream]").arg(label),
+                    true,
+                    false);
 }
 
 // 实时发送开关按钮。
@@ -833,23 +1095,34 @@ void Widget::on_btnSendCapturedFrame_clicked()
 void Widget::on_btnSendLiveVideo_clicked()
 {
     // 运行时开关路径：预览帧 -> QVideoProbe -> sendVideoPayloadWithBatching -> h2c_0。
-    // 这里只切换“是否发送”，不改变相机采集参数。
+    // 这里只切换“是否发送”，相机采集参数由当前 UI 模式决定。
     if (!m_liveVideoSending) {
+        QString modeReason;
+        if (!selectedModeSupportsLiveStreaming(&modeReason)) {
+            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Cannot start live streaming: ") + modeReason);
+            return;
+        }
+        if (!m_previewCamera || m_previewCamera->state() != QCamera::ActiveState) {
+            startPreview();
+        }
+        if (!m_previewCamera || m_previewCamera->state() != QCamera::ActiveState) {
+            ui->plainTextEdit->appendPlainText(
+                        QStringLiteral("[ERROR] Cannot start live streaming: preview camera is not active."));
+            return;
+        }
+
+        clearLiveVideoBuffers();
         m_liveVideoSending = true;
+        m_liveSendStartMs = QDateTime::currentMSecsSinceEpoch();
         m_lastLiveSendMs = 0;
-        m_liveSentFrames = 0;
+        m_liveSentBatches = 0;
         ui->btnSendLiveVideo->setText(QString::fromUtf8("停止实时视频发送(封包+批量)"));
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[XDMA] Live camera streaming to h2c_0 started."));
         return;
     }
 
-    m_liveVideoSending = false;
-    ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
-    ui->plainTextEdit->appendPlainText(
-                QString("[XDMA] Live camera streaming stopped. sent frames=%1, cached-not-sent=%2 bytes")
-                .arg(m_liveSentFrames)
-                .arg(m_videoPacketBatcher.pendingBytes()));
+    stopLiveVideoSending();
 }
 
 // ----- 子模块：XDMA 与测试按钮 -----
@@ -1020,52 +1293,67 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         return;
     }
 
-    // 将视频帧映射到 CPU 可访问内存，再拷贝到 QByteArray。
-    // 负载数据的布局由驱动给出的像素格式与 stride 决定。
     QVideoFrame copy(frame);
     if (!copy.map(QAbstractVideoBuffer::ReadOnly)) {
         return;
     }
 
-    const int bytes = copy.mappedBytes();
-    const uchar *bits = copy.bits();
-    const int width = copy.width();
-    const int height = copy.height();
-    const QVideoFrame::PixelFormat fmt = copy.pixelFormat();
+    CapturedFrame captured;
+    captured.resolution = QSize(copy.width(), copy.height());
+    captured.pixelFormat = copy.pixelFormat();
+    captured.startTimeUs = copy.startTime();
+    captured.planeCount = copy.planeCount();
 
-    QByteArray payload;
-    if (bytes > 0 && bits) {
-        payload.append(reinterpret_cast<const char *>(bits), bytes);
+    const int loopPlaneCount = captured.planeCount > 0 ? captured.planeCount : 1;
+    const int mappedBytesTotal = copy.mappedBytes();
+    for (int p = 0; p < loopPlaneCount; ++p) {
+        captured.bytesPerLines.push_back(copy.bytesPerLine(p));
+        captured.mappedBytesPerPlane.push_back(p == 0 ? mappedBytesTotal : -1);
+    }
+
+    const uchar *bits = copy.bits();
+    if (mappedBytesTotal > 0 && bits) {
+        captured.payload.append(reinterpret_cast<const char *>(bits), mappedBytesTotal);
     }
 
     copy.unmap();
 
-    if (payload.isEmpty()) {
+    if (captured.payload.isEmpty()) {
         return;
     }
 
-    m_lastLiveSendMs = nowMs;
+    CameraModeInfo liveMode;
+    QString modeReason;
+    if (m_useManualPreviewMode) {
+        liveMode = m_manualPreviewMode;
+    } else if (!findDefaultLiveYuyvMode(liveMode, &modeReason)) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Drop raw live frame: ") + modeReason);
+        return;
+    }
+
+    QByteArray payload;
+    QString reason;
+    const QSize expectedResolution = liveMode.settings.resolution();
+    if (!normalizeLiveYuyvFrame(captured, expectedResolution, payload, &reason)) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Drop raw live frame: ") + reason);
+        return;
+    }
+
     const bool ok = sendVideoPayloadWithBatching(payload,
-                                                 QString("live frame %1x%2 %3")
-                                                 .arg(width)
-                                                 .arg(height)
-                                                 .arg(CameraProbe::pixelFormatToString(fmt)),
+                                                 QString("live raw YUYV %1x%2")
+                                                 .arg(expectedResolution.width())
+                                                 .arg(expectedResolution.height()),
                                                  false);
 
     if (!ok) {
         // 发送失败即停流，避免持续错误刷屏和驱动压力累积。
         m_liveVideoSending = false;
+        m_liveSendStartMs = 0;
+        clearLiveVideoBuffers();
         ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[ERROR] Live camera streaming stopped due to XDMA write failure."));
         return;
-    }
-
-    ++m_liveSentFrames;
-    if ((m_liveSentFrames % 30) == 0) {
-        ui->plainTextEdit->appendPlainText(
-                    QString("[XDMA] Live stream progress: sent frames=%1")
-                    .arg(m_liveSentFrames));
     }
 }
 
@@ -1078,6 +1366,12 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
 // 关闭 XDMA 句柄并复位会话状态。
 void Widget::closeXdmaHandles()
 {
+    if (m_liveVideoSending) {
+        stopLiveVideoSending(QStringLiteral("XDMA channel close"));
+    } else {
+        clearLiveVideoBuffers();
+    }
+
     // 重连或退出时都要关闭两类句柄。
     // 封装库内部通常用 CreateFile 打开通道，
     // 因此每个成功打开的通道都必须对应 CloseHandle。
@@ -1457,7 +1751,7 @@ bool Widget::sendXdmaPayload(const QByteArray &payload,
 bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                           const QString &label,
                                           bool verbose,
-                                          bool isolatePayload)
+                                          bool allowSendNow)
 {
     if (videoPayload.isEmpty()) {
         ui->plainTextEdit->appendPlainText(QString("[ERROR] %1 is empty, skip video packetization.").arg(label));
@@ -1465,48 +1759,51 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
     }
 
     QVector<QByteArray> readyBatches;
-    if (isolatePayload) {
-        const int droppedBytes = m_videoPacketBatcher.pendingBytes();
-        if (droppedBytes > 0) {
-            ui->plainTextEdit->appendPlainText(
-                        QString("[PKG] %1 isolate send: drop stale cache=%2B")
-                        .arg(label)
-                        .arg(droppedBytes));
-        }
-        m_videoPacketBatcher.clearPendingCache();
-    }
-
     const VideoPacketBatcher::EnqueueResult result =
-            m_videoPacketBatcher.enqueueVideoPayload(videoPayload,
-                                                     readyBatches,
-                                                     isolatePayload);
+            m_videoPacketBatcher.enqueueVideoPayload(videoPayload, readyBatches);
+    for (const QByteArray &batch : readyBatches) {
+        m_liveReadyBatches.append(batch);
+    }
 
     // [PKG] 日志用于观察三层关系：
     // - raw：输入原始视频字节数；
     // - packets：本次封包后的 1024B 包数量；
-    // - emitted/cached：本次发出的“当前配置批次”数量与剩余缓存字节。
+    // - emitted/cached：本次产出的完整批次、累计待发批次与缓存字节。
     if (verbose || !readyBatches.isEmpty()) {
+        const int batchKB = m_videoPacketBatcher.batchBytes() / 1024;
+        int queuedBatchBytes = 0;
+        for (const QByteArray &batch : m_liveReadyBatches) {
+            queuedBatchBytes += batch.size();
+        }
         ui->plainTextEdit->appendPlainText(
-                    QString("[PKG] %1 raw=%2B -> packets=%3 (%4B), emitted=%5B (%6 batches), cached=%7B")
+                    QString("[PKG] %1 raw=%2B -> packets=%3 (%4B), produced=%5 x %6KB, queued=%7 x %6KB (%8B), cached=%9B, payload-tail=%10B")
                     .arg(label)
                     .arg(result.inputBytes)
                     .arg(result.packetCount)
                     .arg(result.packetBytes)
-                    .arg(result.emittedBatchBytes)
-                    .arg(result.emittedBatchCount)
-                    .arg(result.cachedBytes));
+                    .arg(readyBatches.size())
+                    .arg(batchKB)
+                    .arg(m_liveReadyBatches.size())
+                    .arg(queuedBatchBytes)
+                    .arg(result.cachedBytes)
+                    .arg(result.pendingPayloadBytes));
     }
 
-    for (int i = 0; i < readyBatches.size(); ++i) {
-        // 默认是完整批次；isolatePayload=true 时最后一个可能是尾包。
-        // 在此统一强制单次 write，保证“一个输出块对应一次写入”。
-        const int batchKB = readyBatches[i].size() / 1024;
-        const bool ok = sendXdmaPayload(readyBatches[i],
+    if (!allowSendNow || m_liveReadyBatches.isEmpty()) {
+        return true;
+    }
+
+    const int totalBatches = m_liveReadyBatches.size();
+    for (int i = 0; i < totalBatches; ++i) {
+        // 仅在节流时间窗口到达时发送，并保持“一批次一次写”。
+        const QByteArray batch = m_liveReadyBatches.first();
+        const int batchKB = batch.size() / 1024;
+        const bool ok = sendXdmaPayload(batch,
                                         QString("%1 [%2KB batch %3/%4]")
                                         .arg(label)
                                         .arg(batchKB)
                                         .arg(i + 1)
-                                        .arg(readyBatches.size()),
+                                        .arg(totalBatches),
                                         false,
                                         true);
         if (!ok) {
@@ -1516,8 +1813,16 @@ bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                         .arg(i + 1));
             return false;
         }
+        m_liveReadyBatches.remove(0);
+        ++m_liveSentBatches;
+        if ((m_liveSentBatches % 30) == 0) {
+            ui->plainTextEdit->appendPlainText(
+                        QString("[XDMA] Live stream progress: sent batches=%1")
+                        .arg(m_liveSentBatches));
+        }
     }
 
+    m_lastLiveSendMs = QDateTime::currentMSecsSinceEpoch();
     return true;
 }
 

@@ -12,11 +12,15 @@
 #include <QCameraViewfinder>
 #include <QVideoProbe>
 #include <QByteArray>
+#include <QList>
+#include <QVector>
 #include "cameraprobe.h"
 #include "video_packet_batcher.h"
 
 class QSpinBox;
 class QLineEdit;
+class QComboBox;
+class QPushButton;
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class Widget; }
@@ -58,6 +62,7 @@ private:
 
     // 初始化“节流间隔/写入大小”调参控件，并绑定运行时参数。
     void initializeTransferControls();
+    void initializeModeControls();
     // 初始化 AXI lite 寄存器读写控件（地址/写值输入、读值显示、读写按钮）。
     // 该区域是“寄存器调试入口”，与视频发送链路解耦。
     void initializeAxiLiteControls();
@@ -65,6 +70,16 @@ private:
     // 启动/停止实时预览相机。
     void startPreview();
     void stopPreview();
+    void refreshModeCombo();
+    void applySelectedModeFromCombo();
+    void stopLiveVideoSending(const QString &reason = QString());
+    void clearLiveVideoBuffers();
+    bool selectedModeSupportsLiveStreaming(QString *reason = nullptr) const;
+    bool findDefaultLiveYuyvMode(CameraModeInfo &outMode, QString *report) const;
+    bool normalizeLiveYuyvFrame(const CapturedFrame &frame,
+                                const QSize &expectedResolution,
+                                QByteArray &payload,
+                                QString *reason) const;
 
     // ===== 模块：视频业务发送（封包 + 聚合） =====
     // 视频发送专用入口：
@@ -72,7 +87,7 @@ private:
     bool sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                       const QString &label,
                                       bool verbose = true,
-                                      bool isolatePayload = false);
+                                      bool allowSendNow = true);
 
     // 软件自测入口（纯内存，不依赖 XDMA 设备），改为“手动触发”。
     void runPacketModuleSelfTest();
@@ -119,6 +134,11 @@ private:
     QCamera *m_previewCamera = nullptr;
     QCameraViewfinder *m_viewfinder = nullptr;
     QVideoProbe *m_videoProbe = nullptr;
+    QComboBox *m_modeCombo = nullptr;
+    QPushButton *m_applyModeBtn = nullptr;
+    QList<CameraModeInfo> m_availableModes;
+    bool m_useManualPreviewMode = false;
+    CameraModeInfo m_manualPreviewMode;
 
     // 抓取单帧前会暂停预览，抓取结束后根据该标记恢复。
     bool m_restartPreviewAfterCapture = false;
@@ -130,8 +150,10 @@ private:
 
     // 实时流发送状态（预览帧 -> h2c_0）。
     bool m_liveVideoSending = false;
+    qint64 m_liveSendStartMs = 0;
     qint64 m_lastLiveSendMs = 0;
-    int m_liveSentFrames = 0;
+    int m_liveSentBatches = 0;
+    QVector<QByteArray> m_liveReadyBatches;
 
     // 发送调参：节流间隔和写入批次大小都支持界面实时调整。
     // m_liveStreamThrottleMs：控制最小发送间隔（毫秒）。

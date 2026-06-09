@@ -20,6 +20,7 @@ VideoPacketBatcher::VideoPacketBatcher(const RouteFields &routeFields)
 {
     // 默认按 1MiB 预留，可减少持续流输入时的扩容开销。
     m_batchCache.reserve(m_batchBytes);
+    m_payloadCache.reserve(kPayloadSize);
 }
 
 // ===== 运行时处理 =====
@@ -45,23 +46,42 @@ int VideoPacketBatcher::batchBytes() const
 
 int VideoPacketBatcher::pendingBytes() const
 {
-    // 未满一个批次的数据会保留在缓存中，等待后续输入补齐。
-    return m_batchCache.size();
+    // 返回总缓存：协议包缓存 + 原始尾部缓存。
+    return m_batchCache.size() + m_payloadCache.size();
 }
 
-void VideoPacketBatcher::clearPendingCache()
+int VideoPacketBatcher::pendingPayloadBytes() const
+{
+    return m_payloadCache.size();
+}
+
+void VideoPacketBatcher::discardPendingPayloadBytes()
+{
+    m_payloadCache.clear();
+}
+
+void VideoPacketBatcher::clear()
 {
     m_batchCache.clear();
+    m_payloadCache.clear();
+}
+
+QByteArray VideoPacketBatcher::buildPacketStream(const QByteArray &videoPayload,
+                                                 int *packetCount,
+                                                 int minPacketCount) const
+{
+    return packetizeVideoPayload(videoPayload, packetCount, minPacketCount);
 }
 
 QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayload,
-                                                     int *packetCount) const
+                                                     int *packetCount,
+                                                     int minPacketCount) const
 {
     if (packetCount) {
         *packetCount = 0;
     }
 
-    if (videoPayload.isEmpty()) {
+    if (videoPayload.isEmpty() && minPacketCount <= 0) {
         return {};
     }
 
@@ -69,7 +89,8 @@ QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayl
     // - 每 1006B 生成 1 包；
     // - 最后一包不足 1006B 也必须生成。
     const int totalBytes = videoPayload.size();
-    const int localPacketCount = (totalBytes + kPayloadSize - 1) / kPayloadSize;
+    const int packetCountByPayload = (totalBytes + kPayloadSize - 1) / kPayloadSize;
+    const int localPacketCount = qMax(packetCountByPayload, qMax(0, minPacketCount));
 
     QByteArray packetStream(localPacketCount * kPacketSize, '\0');
     const char *src = videoPayload.constData();
@@ -83,7 +104,7 @@ QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayl
         packet[0] = 0xEB;
         packet[1] = 0x90;
 
-        // lengthH/lengthL：完整包长，包含包头和 payload，固定为 0x0400。
+        // lengthH/lengthL：协议定义为“整包总长度（包头+payload）”，固定 1024(0x0400)。
         packet[2] = static_cast<uchar>((kPacketSize >> 8) & 0xFF);
         packet[3] = static_cast<uchar>(kPacketSize & 0xFF);
 
@@ -112,23 +133,46 @@ QByteArray VideoPacketBatcher::packetizeVideoPayload(const QByteArray &videoPayl
 
 VideoPacketBatcher::EnqueueResult VideoPacketBatcher::enqueueVideoPayload(
         const QByteArray &videoPayload,
-        QVector<QByteArray> &outBatches,
-        bool flushTail)
+        QVector<QByteArray> &outBatches)
 {
     EnqueueResult result;
     result.inputBytes = videoPayload.size();
     outBatches.clear();
 
-    if (videoPayload.isEmpty()) {
-        // 空输入不改变缓存，仅返回当前缓存状态。
-        result.cachedBytes = m_batchCache.size();
+    if (!videoPayload.isEmpty()) {
+        m_payloadCache.append(videoPayload);
+    }
+
+    const int fullPacketCount = m_payloadCache.size() / kPayloadSize;
+    if (fullPacketCount <= 0) {
+        result.pendingPayloadBytes = m_payloadCache.size();
+        result.cachedBytes = m_batchCache.size() + result.pendingPayloadBytes;
         return result;
     }
 
-    int packetCount = 0;
-    const QByteArray packetStream = packetizeVideoPayload(videoPayload, &packetCount);
+    const int sourceBytes = fullPacketCount * kPayloadSize;
+    QByteArray packetStream(fullPacketCount * kPacketSize, '\0');
+    const char *src = m_payloadCache.constData();
 
-    result.packetCount = packetCount;
+    for (int i = 0; i < fullPacketCount; ++i) {
+        uchar *packet = reinterpret_cast<uchar *>(packetStream.data() + i * kPacketSize);
+
+        packet[0] = 0xEB;
+        packet[1] = 0x90;
+        packet[2] = static_cast<uchar>((kPacketSize >> 8) & 0xFF);
+        packet[3] = static_cast<uchar>(kPacketSize & 0xFF);
+
+        std::memcpy(packet + 4, m_routeFields.dest.data(), m_routeFields.dest.size());
+        std::memcpy(packet + 10, m_routeFields.source.data(), m_routeFields.source.size());
+        std::memcpy(packet + 16, m_routeFields.priority.data(), m_routeFields.priority.size());
+        std::memcpy(packet + kHeaderSize,
+                    src + i * kPayloadSize,
+                    static_cast<size_t>(kPayloadSize));
+    }
+
+    m_payloadCache.remove(0, sourceBytes);
+
+    result.packetCount = fullPacketCount;
     result.packetBytes = packetStream.size();
 
     for (int offset = 0; offset < packetStream.size(); offset += kPacketSize) {
@@ -139,18 +183,12 @@ VideoPacketBatcher::EnqueueResult VideoPacketBatcher::enqueueVideoPayload(
             // 每凑满一个批次输出一次，剩余字节继续缓存。
             outBatches.append(m_batchCache.left(m_batchBytes));
             m_batchCache.remove(0, m_batchBytes);
-            result.emittedBatchBytes += m_batchBytes;
         }
     }
 
-    if (flushTail && !m_batchCache.isEmpty()) {
-        outBatches.append(m_batchCache);
-        ++result.emittedBatchCount;
-        result.emittedBatchBytes += m_batchCache.size();
-        m_batchCache.clear();
-    }
-
-    result.cachedBytes = m_batchCache.size();
+    result.emittedBatchBytes = result.emittedBatchCount * m_batchBytes;
+    result.pendingPayloadBytes = m_payloadCache.size();
+    result.cachedBytes = m_batchCache.size() + result.pendingPayloadBytes;
     return result;
 }
 
@@ -161,32 +199,52 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
     QStringList errors;
     const RouteFields route = defaultRouteFields();
 
-    // 样本 1：1500B，验证拆包、固定总包长、补零、路由字段偏移。
+    // 样本 1：1500B，流式输入不在每次 enqueue 末尾补零。
+    // 应只生成 1 个完整包，并保留 494B 原始尾部缓存。
     QByteArray sample(1500, '\0');
     for (int i = 0; i < sample.size(); ++i) {
         sample[i] = static_cast<char>(i & 0xFF);
     }
 
+    VideoPacketBatcher streamBatcher(route);
+    QVector<QByteArray> streamBatches;
+    const auto streamResult = streamBatcher.enqueueVideoPayload(sample, streamBatches);
+    if (streamResult.packetCount != 1) {
+        errors << QString("stream packet count mismatch, expect=1 actual=%1")
+                  .arg(streamResult.packetCount);
+    }
+    if (streamResult.pendingPayloadBytes != 494) {
+        errors << QString("stream pending payload mismatch, expect=494 actual=%1")
+                  .arg(streamResult.pendingPayloadBytes);
+    }
+    if (!streamBatches.isEmpty()) {
+        errors << QString("stream should not emit batch, actual=%1")
+                  .arg(streamBatches.size());
+    }
+    streamBatcher.clear();
+    if (streamBatcher.pendingBytes() != 0 || streamBatcher.pendingPayloadBytes() != 0) {
+        errors << QString("clear cache mismatch, pending=%1 payloadTail=%2")
+                  .arg(streamBatcher.pendingBytes())
+                  .arg(streamBatcher.pendingPayloadBytes());
+    }
+
+    // 样本 1.1：仅验证“完整 payload”封包格式（length 固定 0x0400）。
     VideoPacketBatcher packetizer(route);
     int packetCount = 0;
-    const QByteArray packetized = packetizer.packetizeVideoPayload(sample, &packetCount);
-    if (packetCount != 2) {
-        errors << QString("packet count mismatch, expect=2 actual=%1").arg(packetCount);
+    const QByteArray packetized =
+            packetizer.packetizeVideoPayload(QByteArray(kPayloadSize, '\x5A'), &packetCount);
+    if (packetCount != 1) {
+        errors << QString("packet count mismatch, expect=1 actual=%1").arg(packetCount);
     }
-    if (packetized.size() != 2 * kPacketSize) {
+    if (packetized.size() != kPacketSize) {
         errors << QString("packetized bytes mismatch, expect=%1 actual=%2")
-                  .arg(2 * kPacketSize)
+                  .arg(kPacketSize)
                   .arg(packetized.size());
     }
-
-    if (packetized.size() >= 2 * kPacketSize) {
+    if (packetized.size() >= kPacketSize) {
         const uchar *pkt0 = reinterpret_cast<const uchar *>(packetized.constData());
-        const uchar *pkt1 = pkt0 + kPacketSize;
-
         const int len0 = (static_cast<int>(pkt0[2]) << 8) | static_cast<int>(pkt0[3]);
-        const int len1 = (static_cast<int>(pkt1[2]) << 8) | static_cast<int>(pkt1[3]);
-
-        if (!(pkt0[0] == 0xEB && pkt0[1] == 0x90 && pkt1[0] == 0xEB && pkt1[1] == 0x90)) {
+        if (!(pkt0[0] == 0xEB && pkt0[1] == 0x90)) {
             errors << QStringLiteral("frame header mismatch, expect EB 90");
         }
         if (len0 != kPacketSize) {
@@ -194,40 +252,20 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
                       .arg(kPacketSize)
                       .arg(len0);
         }
-        if (len1 != kPacketSize) {
-            errors << QString("packet1 length mismatch, expect=%1 actual=%2")
-                      .arg(kPacketSize)
-                      .arg(len1);
-        }
 
-        if (std::memcmp(pkt0 + 4, route.dest.data(), route.dest.size()) != 0
-                || std::memcmp(pkt1 + 4, route.dest.data(), route.dest.size()) != 0) {
+        if (std::memcmp(pkt0 + 4, route.dest.data(), route.dest.size()) != 0) {
             errors << QStringLiteral("dest field mismatch");
         }
-
-        if (std::memcmp(pkt0 + 10, route.source.data(), route.source.size()) != 0
-                || std::memcmp(pkt1 + 10, route.source.data(), route.source.size()) != 0) {
+        if (std::memcmp(pkt0 + 10, route.source.data(), route.source.size()) != 0) {
             errors << QStringLiteral("source field mismatch");
         }
-
-        if (std::memcmp(pkt0 + 16, route.priority.data(), route.priority.size()) != 0
-                || std::memcmp(pkt1 + 16, route.priority.data(), route.priority.size()) != 0) {
+        if (std::memcmp(pkt0 + 16, route.priority.data(), route.priority.size()) != 0) {
             errors << QStringLiteral("priority field mismatch");
         }
 
-        if (std::memcmp(pkt0 + kHeaderSize, sample.constData(), kPayloadSize) != 0) {
-            errors << QStringLiteral("packet0 payload mismatch");
-        }
-
-        if (std::memcmp(pkt1 + kHeaderSize,
-                        sample.constData() + kPayloadSize,
-                        494) != 0) {
-            errors << QStringLiteral("packet1 payload mismatch");
-        }
-
-        for (int i = kHeaderSize + 494; i < kPacketSize; ++i) {
-            if (pkt1[i] != 0x00) {
-                errors << QString("packet1 padding mismatch at byte=%1").arg(i);
+        for (int i = 0; i < kPayloadSize; ++i) {
+            if (pkt0[kHeaderSize + i] != static_cast<uchar>(0x5A)) {
+                errors << QString("packet payload mismatch at byte=%1").arg(i);
                 break;
             }
         }
@@ -262,7 +300,7 @@ bool VideoPacketBatcher::runSelfTest(QString *report)
     const bool ok = errors.isEmpty();
     if (report) {
         if (ok) {
-            *report = QStringLiteral("PASS packet-format and 1MiB aggregation");
+            *report = QStringLiteral("PASS packet-format, cache clear, and 1MiB aggregation");
         } else {
             *report = QStringLiteral("FAIL: ") + errors.join(QStringLiteral("; "));
         }
