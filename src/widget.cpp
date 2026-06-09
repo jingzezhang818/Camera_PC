@@ -400,7 +400,7 @@ void Widget::initializeTransferControls()
     QLabel *throttleLabel = new QLabel(
                 QString::fromWCharArray(L"\u8282\u6D41\u95F4\u9694(ms):"), panel);
     m_throttleSpin = new QSpinBox(panel);
-    m_throttleSpin->setRange(5, 1000);
+    m_throttleSpin->setRange(0, 1000);
     m_throttleSpin->setSingleStep(5);
     m_throttleSpin->setValue(static_cast<int>(m_liveStreamThrottleMs));
 
@@ -422,7 +422,7 @@ void Widget::initializeTransferControls()
     connect(m_throttleSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int value) {
         // 运行时更新节流参数，无需重启预览或重建相机。
-        m_liveStreamThrottleMs = qMax<qint64>(1, value);
+        m_liveStreamThrottleMs = qMax<qint64>(0, value);
         if (ui && ui->plainTextEdit) {
             ui->plainTextEdit->appendPlainText(
                         QString("[CFG] Live throttle interval set to %1 ms")
@@ -1285,7 +1285,9 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
     // 发送节流：限制发送速率，避免 PCIe/H2C 被灌满，
     // 同时降低 GUI 线程压力。
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    if (m_lastLiveSendMs > 0 && (nowMs - m_lastLiveSendMs) < m_liveStreamThrottleMs) {
+    if (m_liveStreamThrottleMs > 0
+            && m_lastLiveSendMs > 0
+            && (nowMs - m_lastLiveSendMs) < m_liveStreamThrottleMs) {
         return;
     }
 
