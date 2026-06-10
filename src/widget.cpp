@@ -16,6 +16,7 @@
 #include <QSignalBlocker>
 #include <QSet>
 #include <QVector>
+#include <QMetaType>
 #include <vector>
 #include <cstring>
 
@@ -113,87 +114,24 @@ bool yuyvToRgbImage(const CapturedFrame &frame, QImage &outImage)
 
 constexpr int kYuyvBytesPerPixel = 2;
 
-bool isExactPositiveFrameRate(double minFps, double maxFps)
+bool isValidPreviewMode(const LinuxPreviewMode &mode)
 {
-    if (minFps <= 0.0 || maxFps <= 0.0) {
-        return false;
-    }
-
-    const double delta = minFps - maxFps;
-    return delta > -0.001 && delta < 0.001;
+    return mode.isValid();
 }
 
-bool isValidYuyvMode(const CameraModeInfo &mode)
-{
-    const QSize resolution = mode.settings.resolution();
-    return mode.settings.pixelFormat() == QVideoFrame::Format_YUYV &&
-            resolution.width() > 0 &&
-            resolution.height() > 0;
-}
-
-int firstYuyvModeIndex(const QList<CameraModeInfo> &modes)
+int firstPreviewModeIndex(const QList<LinuxPreviewMode> &modes)
 {
     for (int i = 0; i < modes.size(); ++i) {
-        if (isValidYuyvMode(modes[i])) {
+        if (isValidPreviewMode(modes[i])) {
             return i;
         }
     }
     return -1;
 }
 
-QString modeToComboText(const CameraModeInfo &mode)
+QString modeToComboText(const LinuxPreviewMode &mode)
 {
-    const QSize resolution = mode.settings.resolution();
-    const QString prefix = QString("%1x%2 | %3 | ")
-            .arg(resolution.width())
-            .arg(resolution.height())
-            .arg(CameraProbe::pixelFormatToString(mode.settings.pixelFormat()));
-
-    if (isExactPositiveFrameRate(mode.settings.minimumFrameRate(),
-                                 mode.settings.maximumFrameRate())) {
-        return prefix + QString("fps=%1")
-                .arg(mode.settings.maximumFrameRate(), 0, 'f', 3);
-    }
-
-    if (mode.settings.minimumFrameRate() > 0.0 ||
-        mode.settings.maximumFrameRate() > 0.0) {
-        return prefix + QString("fps[%1,%2]")
-                .arg(mode.settings.minimumFrameRate(), 0, 'f', 3)
-                .arg(mode.settings.maximumFrameRate(), 0, 'f', 3);
-    }
-
-    return prefix + QStringLiteral("fps=driver");
-}
-
-QCameraViewfinderSettings makeDriverRequestSettings(const QCameraViewfinderSettings &source)
-{
-    QCameraViewfinderSettings request;
-
-    const QSize resolution = source.resolution();
-    if (resolution.width() > 0 && resolution.height() > 0) {
-        request.setResolution(resolution);
-    }
-
-    if (source.pixelFormat() != QVideoFrame::Format_Invalid) {
-        request.setPixelFormat(source.pixelFormat());
-    }
-
-    if (isExactPositiveFrameRate(source.minimumFrameRate(),
-                                 source.maximumFrameRate())) {
-        request.setMinimumFrameRate(source.minimumFrameRate());
-        request.setMaximumFrameRate(source.maximumFrameRate());
-    }
-
-    return request;
-}
-
-bool hasDriverRequestSettings(const QCameraViewfinderSettings &settings)
-{
-    const QSize resolution = settings.resolution();
-    return (resolution.width() > 0 && resolution.height() > 0) ||
-            settings.pixelFormat() != QVideoFrame::Format_Invalid ||
-            settings.minimumFrameRate() > 0.0 ||
-            settings.maximumFrameRate() > 0.0;
+    return mode.displayText();
 }
 
 } // 匿名命名空间
@@ -210,6 +148,8 @@ Widget::Widget(QWidget *parent)
     // 硬件链路测试包依赖 XDMA 通道就绪，初始禁用。
     ui->btnSendLinkTestPacket->setEnabled(false);
     ui->btnSendCapturedFrame->setEnabled(false);
+    qRegisterMetaType<CapturedFrame>("CapturedFrame");
+    qRegisterMetaType<LinuxAcceptedMode>("LinuxAcceptedMode");
     initializePreview();
 
     connect(m_probe, SIGNAL(logMessage(QString)),
@@ -232,22 +172,32 @@ Widget::~Widget()
     delete ui;
 }
 
-// 初始化实时预览：创建 Viewfinder、插入布局、挂接 VideoProbe。
+// 初始化实时预览：创建 native 预览窗口并挂接 LinuxPreviewSession。
 void Widget::initializePreview()
 {
-    m_viewfinder = new QCameraViewfinder(this);
-    m_viewfinder->setObjectName("cameraPreview");
-    m_viewfinder->setMinimumHeight(280);
-    m_viewfinder->setAspectRatioMode(Qt::KeepAspectRatio);
+    m_previewWidget = new QWidget(this);
+    m_previewWidget->setObjectName("cameraPreview");
+    m_previewWidget->setMinimumHeight(280);
+    m_previewWidget->setAttribute(Qt::WA_NativeWindow, true);
+    m_previewWidget->setAttribute(Qt::WA_DontCreateNativeAncestors, true);
+    m_previewWidget->setAutoFillBackground(true);
+    m_previewWidget->setStyleSheet(QStringLiteral("background: #050505;"));
 
-    ui->verticalLayout->insertWidget(1, m_viewfinder, 1);
+    ui->verticalLayout->insertWidget(1, m_previewWidget, 1);
+
+    m_previewSession = new LinuxPreviewSession(this);
+    connect(m_previewSession, &LinuxPreviewSession::logMessage,
+            this, &Widget::onPreviewLog);
+    connect(m_previewSession, &LinuxPreviewSession::acceptedModeChanged,
+            this, &Widget::onAcceptedPreviewModeChanged);
+    connect(m_previewSession, &LinuxPreviewSession::rawFrameAvailable,
+            this, &Widget::onRawPreviewFrameAvailable);
+    connect(m_previewSession, &LinuxPreviewSession::rawFrameFailed,
+            this, &Widget::onRawPreviewFrameFailed);
+
     initializeModeControls();
     initializeTransferControls();
     initializeAxiLiteControls();
-
-    m_videoProbe = new QVideoProbe(this);
-    connect(m_videoProbe, &QVideoProbe::videoFrameProbed,
-            this, &Widget::onPreviewFrameProbed);
 
     startPreview();
 }
@@ -290,40 +240,42 @@ void Widget::refreshModeCombo()
     const QString previousText = m_modeCombo->currentText();
     const QSignalBlocker blocker(m_modeCombo);
     m_modeCombo->clear();
-    m_availableModes.clear();
+    m_availablePreviewModes.clear();
 
-    const QList<CameraModeInfo> modes = CameraProbe::enumerateAllModes();
+    QStringList enumLogs;
+    const QList<LinuxPreviewMode> modes = LinuxPreviewSession::enumerateModes(&enumLogs);
+    for (const QString &line : enumLogs) {
+        if (ui && ui->plainTextEdit) {
+            ui->plainTextEdit->appendPlainText(line);
+        }
+    }
+
     QSet<QString> dedup;
-    for (const CameraModeInfo &mode : modes) {
-        const QSize resolution = mode.settings.resolution();
-        const bool hasResolution = resolution.width() > 0 && resolution.height() > 0;
-        const bool hasFormat = mode.settings.pixelFormat() != QVideoFrame::Format_Invalid;
-        const bool hasFps = mode.settings.minimumFrameRate() > 0.0 ||
-                mode.settings.maximumFrameRate() > 0.0;
-        if (!hasResolution && !hasFormat && !hasFps) {
+    for (const LinuxPreviewMode &mode : modes) {
+        if (!mode.isValid()) {
             continue;
         }
 
         const QString key = QString("%1|%2x%3|%4|%5|%6")
-                .arg(mode.cameraIndex)
-                .arg(resolution.width())
-                .arg(resolution.height())
-                .arg(static_cast<int>(mode.settings.pixelFormat()))
-                .arg(mode.settings.minimumFrameRate(), 0, 'f', 3)
-                .arg(mode.settings.maximumFrameRate(), 0, 'f', 3);
+                .arg(mode.devicePath)
+                .arg(mode.resolution.width())
+                .arg(mode.resolution.height())
+                .arg(mode.fourcc)
+                .arg(mode.fpsNumerator)
+                .arg(mode.fpsDenominator);
         if (dedup.contains(key)) {
             continue;
         }
         dedup.insert(key);
-        m_availableModes.push_back(mode);
+        m_availablePreviewModes.push_back(mode);
     }
 
-    for (const CameraModeInfo &mode : m_availableModes) {
+    for (const LinuxPreviewMode &mode : m_availablePreviewModes) {
         m_modeCombo->addItem(modeToComboText(mode));
     }
 
     if (m_modeCombo->count() == 0) {
-        m_modeCombo->addItem(QStringLiteral("No explicit camera mode available"));
+        m_modeCombo->addItem(QStringLiteral("No discrete YUYV V4L2 mode available"));
         m_modeCombo->setEnabled(false);
         m_useManualPreviewMode = false;
         if (m_applyModeBtn) {
@@ -337,7 +289,7 @@ void Widget::refreshModeCombo()
         m_applyModeBtn->setEnabled(true);
     }
 
-    int targetIndex = firstYuyvModeIndex(m_availableModes);
+    int targetIndex = firstPreviewModeIndex(m_availablePreviewModes);
     if (targetIndex < 0) {
         targetIndex = 0;
     }
@@ -349,22 +301,22 @@ void Widget::refreshModeCombo()
     }
 
     m_modeCombo->setCurrentIndex(targetIndex);
-    if (targetIndex >= 0 && targetIndex < m_availableModes.size()) {
-        m_manualPreviewMode = m_availableModes[targetIndex];
+    if (targetIndex >= 0 && targetIndex < m_availablePreviewModes.size()) {
+        m_manualPreviewMode = m_availablePreviewModes[targetIndex];
         m_useManualPreviewMode = true;
     }
 }
 
 void Widget::applySelectedModeFromCombo()
 {
-    if (!m_modeCombo || m_availableModes.isEmpty()) {
+    if (!m_modeCombo || m_availablePreviewModes.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[WARN] No selectable camera mode is available."));
         return;
     }
 
     const int index = m_modeCombo->currentIndex();
-    if (index < 0 || index >= m_availableModes.size()) {
+    if (index < 0 || index >= m_availablePreviewModes.size()) {
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[WARN] Please select a valid camera mode."));
         return;
@@ -375,8 +327,9 @@ void Widget::applySelectedModeFromCombo()
     }
     clearLiveVideoBuffers();
 
-    m_manualPreviewMode = m_availableModes[index];
+    m_manualPreviewMode = m_availablePreviewModes[index];
     m_useManualPreviewMode = true;
+    m_hasAcceptedPreviewMode = false;
     ui->plainTextEdit->appendPlainText(
                 QString("[INFO] Applying mode: %1")
                 .arg(modeToComboText(m_manualPreviewMode)));
@@ -569,128 +522,44 @@ void Widget::initializeAxiLiteControls()
 }
 
 // 启动实时预览。
-// 若已有活动预览则直接返回，避免重复创建相机对象。
+// 若已有活动预览则直接返回，避免重复创建 GStreamer 管线。
 void Widget::startPreview()
 {
-    if (!m_viewfinder) {
+    if (!m_previewWidget || !m_previewSession) {
         return;
     }
 
-    if (m_previewCamera && m_previewCamera->state() == QCamera::ActiveState) {
+    if (m_previewSession->isRunning()) {
         return;
     }
 
-    const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
-    if (cameras.isEmpty()) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Live preview is unavailable because no camera was found."));
-        return;
+    if (!m_useManualPreviewMode || !m_manualPreviewMode.isValid()) {
+        refreshModeCombo();
     }
-
-    CameraModeInfo selected;
-    if (m_useManualPreviewMode) {
-        selected = m_manualPreviewMode;
-    }
-
-    QCameraInfo info;
-    if (selected.cameraIndex >= 0 && selected.cameraIndex < cameras.size()) {
-        info = cameras[selected.cameraIndex];
-    } else {
-        info = cameras.first();
-        selected.cameraIndex = 0;
-        selected.cameraInfo = info;
-        selected.description = info.description();
-        selected.deviceName = info.deviceName();
-    }
-
-    qInfo().noquote() << QString("[CAMERA] selected preview device: desc=%1, dev=%2")
-                         .arg(info.description())
-                         .arg(info.deviceName());
-
-    if (m_previewCamera) {
-        m_previewCamera->stop();
-        m_previewCamera->deleteLater();
-        m_previewCamera = nullptr;
-    }
-
-    m_previewCamera = new QCamera(info, this);
-    m_previewCamera->setCaptureMode(QCamera::CaptureViewfinder);
-
-    const QCameraViewfinderSettings request = makeDriverRequestSettings(selected.settings);
-    if (hasDriverRequestSettings(request)) {
-        m_previewCamera->setViewfinderSettings(request);
-    }
-
-    m_previewCamera->setViewfinder(m_viewfinder);
-
-    ui->plainTextEdit->appendPlainText(
-                QString("[INFO] Preview request profile: %1x%2 %3 fps=[%4,%5]")
-                .arg(request.resolution().width())
-                .arg(request.resolution().height())
-                .arg(CameraProbe::pixelFormatToString(request.pixelFormat()))
-                .arg(request.minimumFrameRate())
-                .arg(request.maximumFrameRate()));
-
-    if (m_videoProbe) {
-        if (!m_videoProbe->setSource(m_previewCamera)) {
-            ui->plainTextEdit->appendPlainText(
-                        QStringLiteral("[WARN] Video probe attach failed. Live XDMA streaming may be unavailable."));
-        }
-    }
-
-    connect(m_previewCamera, SIGNAL(error(QCamera::Error)),
-            this, SLOT(onPreviewCameraError(QCamera::Error)));
-
-    m_previewCamera->start();
-    ui->plainTextEdit->appendPlainText(
-                QString("[INFO] Live preview started: %1")
-                .arg(info.description()));
-
-    QTimer::singleShot(300, this, [this]() {
-        // 延迟读取 viewfinderSettings，可提高拿到有效默认参数的概率。
-        if (!m_previewCamera) {
-            return;
-        }
-
-        const QCameraViewfinderSettings s = m_previewCamera->viewfinderSettings();
-        const QSize r = s.resolution();
-        const bool hasResolution = r.width() > 0 && r.height() > 0;
-        const bool hasFormat = s.pixelFormat() != QVideoFrame::Format_Invalid;
-        const bool hasFrameRate = s.minimumFrameRate() > 0.0 || s.maximumFrameRate() > 0.0;
-
-        if (!hasResolution && !hasFormat && !hasFrameRate) {
-            ui->plainTextEdit->appendPlainText(
-                        QStringLiteral("[INFO] Preview default params: driver does not expose explicit default viewfinder settings."));
-            return;
-        }
-
+    if (!m_useManualPreviewMode || !m_manualPreviewMode.isValid()) {
         ui->plainTextEdit->appendPlainText(
-                    QString("[INFO] Preview default params: resolution=%1x%2, format=%3, fps=[%4,%5]")
-                    .arg(s.resolution().width())
-                    .arg(s.resolution().height())
-                    .arg(CameraProbe::pixelFormatToString(s.pixelFormat()))
-                    .arg(s.minimumFrameRate())
-                    .arg(s.maximumFrameRate()));
-    });
+                    QStringLiteral("[WARN] Live preview is unavailable because no discrete YUYV V4L2 mode was found."));
+        return;
+    }
+
+    ui->plainTextEdit->appendPlainText(
+                QString("[INFO] Preview requested mode: %1")
+                .arg(m_manualPreviewMode.displayText()));
+
+    QString reason;
+    if (!m_previewSession->start(m_manualPreviewMode, m_previewWidget, &reason)) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[ERROR] Linux preview start failed: %1")
+                    .arg(reason));
+    }
 }
 
-// 停止并释放预览相机。
+// 停止并释放 Linux 预览管线。
 void Widget::stopPreview()
 {
-    // 先解绑 probe，避免相机销毁时 probe 仍持有旧 source。
-    if (m_videoProbe) {
-        m_videoProbe->setSource(static_cast<QMediaObject *>(nullptr));
+    if (m_previewSession) {
+        m_previewSession->stop();
     }
-
-    if (!m_previewCamera) {
-        return;
-    }
-
-    disconnect(m_previewCamera, nullptr, this, nullptr);
-    m_previewCamera->setViewfinder(static_cast<QVideoWidget *>(nullptr));
-    m_previewCamera->stop();
-    m_previewCamera->unload();
-    delete m_previewCamera;
-    m_previewCamera = nullptr;
 }
 
 void Widget::clearLiveVideoBuffers()
@@ -719,6 +588,9 @@ void Widget::stopLiveVideoSending(const QString &reason)
 
     m_liveVideoSending = false;
     m_liveSendStartMs = 0;
+    if (m_previewSession) {
+        m_previewSession->setRawFrameDeliveryEnabled(false);
+    }
     ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
 
     const QString suffix = reason.isEmpty()
@@ -737,73 +609,13 @@ void Widget::stopLiveVideoSending(const QString &reason)
 
 bool Widget::selectedModeSupportsLiveStreaming(QString *reason) const
 {
-    CameraModeInfo mode;
-    QString modeReport;
-    if (m_useManualPreviewMode) {
-        mode = m_manualPreviewMode;
-    } else if (!findDefaultLiveYuyvMode(mode, &modeReport)) {
-        if (reason) {
-            *reason = modeReport;
-        }
-        return false;
-    }
-
-    if (isValidYuyvMode(mode)) {
+    if (m_useManualPreviewMode && m_manualPreviewMode.isValid()) {
         return true;
     }
 
-    const QSize resolution = mode.settings.resolution();
-    const QVideoFrame::PixelFormat format = mode.settings.pixelFormat();
     if (reason) {
-        *reason = QString("Live XDMA streaming supports YUYV raw only, current mode is %1x%2 %3.")
-                .arg(resolution.width())
-                .arg(resolution.height())
-                .arg(CameraProbe::pixelFormatToString(format));
+        *reason = QStringLiteral("Live XDMA streaming requires a selectable discrete V4L2 YUYV mode.");
     }
-    return false;
-}
-
-bool Widget::findDefaultLiveYuyvMode(CameraModeInfo &outMode, QString *report) const
-{
-    QList<CameraModeInfo> modes = m_availableModes;
-    if (modes.isEmpty()) {
-        modes = CameraProbe::enumerateYuy2Modes();
-    }
-    QStringList available;
-
-    for (const CameraModeInfo &mode : modes) {
-        const QSize resolution = mode.settings.resolution();
-        if (mode.settings.pixelFormat() == QVideoFrame::Format_YUYV) {
-            available << QString("%1 dev=%2 %3x%4 fps=[%5,%6]")
-                         .arg(mode.description)
-                         .arg(mode.deviceName)
-                         .arg(resolution.width())
-                         .arg(resolution.height())
-                         .arg(mode.settings.minimumFrameRate())
-                         .arg(mode.settings.maximumFrameRate());
-        }
-
-        if (isValidYuyvMode(mode)) {
-            outMode = mode;
-            if (report) {
-                *report = QString("Default YUYV mode selected: %1x%2 fps=[%3,%4].")
-                        .arg(resolution.width())
-                        .arg(resolution.height())
-                        .arg(mode.settings.minimumFrameRate())
-                        .arg(mode.settings.maximumFrameRate());
-            }
-            return true;
-        }
-    }
-
-    if (report) {
-        if (available.isEmpty()) {
-            *report = QStringLiteral("No valid YUYV modes were reported by the camera driver.");
-        } else {
-            *report = QStringLiteral("Available YUYV modes: ") + available.join(QStringLiteral(" | "));
-        }
-    }
-
     return false;
 }
 
@@ -904,14 +716,36 @@ void Widget::on_btnListModes_clicked()
 {
     ui->plainTextEdit->clear();
 
+    QStringList enumLogs;
+    const QList<LinuxPreviewMode> previewModes = LinuxPreviewSession::enumerateModes(&enumLogs);
+    ui->plainTextEdit->appendPlainText("=== V4L2 Preview Mode Summary ===");
+    ui->plainTextEdit->appendPlainText(
+                QString("discrete YUYV entries: %1").arg(previewModes.size()));
+    for (const QString &line : enumLogs) {
+        ui->plainTextEdit->appendPlainText(line);
+    }
+    const int showPreviewCount = qMin(previewModes.size(), 12);
+    for (int i = 0; i < showPreviewCount; ++i) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("  #%1 %2")
+                    .arg(i + 1)
+                    .arg(previewModes[i].displayText()));
+    }
+    if (previewModes.size() > showPreviewCount) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("  ... %1 more").arg(previewModes.size() - showPreviewCount));
+    }
+
+    refreshModeCombo();
+
     const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
-    ui->plainTextEdit->appendPlainText("=== Camera Summary ===");
+    ui->plainTextEdit->appendPlainText("=== Qt Single-frame Camera Summary ===");
     ui->plainTextEdit->appendPlainText(
                 QString("camera count: %1").arg(cameras.size()));
 
     if (cameras.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
-                    QStringLiteral("[ERROR] No camera is visible to this app."));
+                    QStringLiteral("[WARN] No Qt camera is visible to CameraProbe."));
         return;
     }
 
@@ -928,13 +762,11 @@ void Widget::on_btnListModes_clicked()
                              .arg(info.deviceName());
     }
 
-    refreshModeCombo();
-
     const auto modes = CameraProbe::enumerateAllModes();
     QList<CameraModeInfo> validModes;
     validModes.reserve(modes.size());
 
-    ui->plainTextEdit->appendPlainText("=== Mode Summary ===");
+    ui->plainTextEdit->appendPlainText("=== Qt Single-frame Mode Summary ===");
     ui->plainTextEdit->appendPlainText(
                 QString("enumerated entries: %1").arg(modes.size()));
 
@@ -988,12 +820,7 @@ void Widget::on_btnGrabOneFrame_clicked()
 
     CameraModeInfo selected;
     QString reason;
-    if (m_useManualPreviewMode) {
-        selected = m_manualPreviewMode;
-        ui->plainTextEdit->appendPlainText(
-                    QString("[INFO] Single-frame capture uses current UI mode: %1")
-                    .arg(modeToComboText(selected)));
-    } else if (findDefaultLiveYuyvMode(selected, &reason)) {
+    if (CameraProbe::findPreferredYuy2Mode(640, 480, selected, &reason)) {
         ui->plainTextEdit->appendPlainText(QStringLiteral("[INFO] ") + reason);
     } else {
         const QCameraInfo info = cameras.first();
@@ -1067,9 +894,12 @@ void Widget::on_btnSendCapturedFrame_clicked()
         label = QString("saved raw %1").arg(m_lastSavedRawFilePath);
     }
 
+    constexpr int kCachedFrameFixedPacketCount = 460;
     int packetCount = 0;
     const QByteArray packetStream =
-            m_videoPacketBatcher.buildPacketStream(payload, &packetCount);
+            m_videoPacketBatcher.buildPacketStream(payload,
+                                                   &packetCount,
+                                                   kCachedFrameFixedPacketCount);
     if (packetStream.isEmpty()) {
         ui->plainTextEdit->appendPlainText(
                     QString("[ERROR] Packetization failed for cached frame: %1")
@@ -1078,11 +908,12 @@ void Widget::on_btnSendCapturedFrame_clicked()
     }
 
     ui->plainTextEdit->appendPlainText(
-                QString("[PKG][DIRECT] %1 raw=%2B -> packets=%3 (%4B)")
+                QString("[PKG][DIRECT] %1 raw=%2B -> packets=%3 (%4B), fixed-min=%5")
                 .arg(label)
                 .arg(payload.size())
                 .arg(packetCount)
-                .arg(packetStream.size()));
+                .arg(packetStream.size())
+                .arg(kCachedFrameFixedPacketCount));
 
     sendXdmaPayload(packetStream,
                     QString("%1 [direct packet stream]").arg(label),
@@ -1091,10 +922,10 @@ void Widget::on_btnSendCapturedFrame_clicked()
 }
 
 // 实时发送开关按钮。
-// 开启后由 onPreviewFrameProbed 持续处理帧并发送；关闭后仅保留预览不发送。
+// 开启后由 LinuxPreviewSession appsink 持续送出 raw YUYV；关闭后仅保留预览。
 void Widget::on_btnSendLiveVideo_clicked()
 {
-    // 运行时开关路径：预览帧 -> QVideoProbe -> sendVideoPayloadWithBatching -> h2c_0。
+    // 运行时开关路径：GStreamer appsink -> sendVideoPayloadWithBatching -> h2c_0。
     // 这里只切换“是否发送”，相机采集参数由当前 UI 模式决定。
     if (!m_liveVideoSending) {
         QString modeReason;
@@ -1102,17 +933,18 @@ void Widget::on_btnSendLiveVideo_clicked()
             ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Cannot start live streaming: ") + modeReason);
             return;
         }
-        if (!m_previewCamera || m_previewCamera->state() != QCamera::ActiveState) {
+        if (!m_previewSession || !m_previewSession->isRunning()) {
             startPreview();
         }
-        if (!m_previewCamera || m_previewCamera->state() != QCamera::ActiveState) {
+        if (!m_previewSession || !m_previewSession->isRunning()) {
             ui->plainTextEdit->appendPlainText(
-                        QStringLiteral("[ERROR] Cannot start live streaming: preview camera is not active."));
+                        QStringLiteral("[ERROR] Cannot start live streaming: Linux preview session is not active."));
             return;
         }
 
         clearLiveVideoBuffers();
         m_liveVideoSending = true;
+        m_previewSession->setRawFrameDeliveryEnabled(true);
         m_liveSendStartMs = QDateTime::currentMSecsSinceEpoch();
         m_lastLiveSendMs = 0;
         m_liveSentBatches = 0;
@@ -1262,21 +1094,36 @@ void Widget::onProbeFailed(const QString &reason)
     }
 }
 
-// 预览相机错误回调。
-void Widget::onPreviewCameraError(QCamera::Error error)
+// Linux 预览日志回调。
+void Widget::onPreviewLog(const QString &msg)
 {
-    Q_UNUSED(error);
-    const QString msg = m_previewCamera ? m_previewCamera->errorString()
-                                        : QStringLiteral("Unknown preview error");
-    ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Live preview error: ") + msg);
+    ui->plainTextEdit->appendPlainText(msg);
 }
 
-// 预览帧回调（实时发送主链路）：
+// V4L2 accepted mode 回调：记录驱动实际接受的采集参数。
+void Widget::onAcceptedPreviewModeChanged(const LinuxAcceptedMode &mode)
+{
+    m_acceptedPreviewMode = mode;
+    m_hasAcceptedPreviewMode = true;
+    ui->plainTextEdit->appendPlainText(
+                QString("[INFO] Preview accepted mode: %1")
+                .arg(mode.displayText()));
+}
+
+void Widget::onRawPreviewFrameFailed(const QString &reason)
+{
+    ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Raw preview frame failed: ") + reason);
+    if (m_liveVideoSending) {
+        stopLiveVideoSending(QStringLiteral("raw preview failure"));
+    }
+}
+
+// 预览 raw 帧回调（实时发送主链路）：
 // 1) 根据开关和节流条件决定是否发送；
-// 2) map 帧并拷贝原始字节；
+// 2) 校验并归一化 raw YUYV stride；
 // 3) 调用 sendVideoPayloadWithBatching 完成“封包+聚合+发送”；
 // 4) 错误时自动停流并回退 UI 状态。
-void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
+void Widget::onRawPreviewFrameAvailable(const CapturedFrame &frame)
 {
     if (!m_liveVideoSending) {
         return;
@@ -1291,52 +1138,16 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         return;
     }
 
-    if (!frame.isValid()) {
-        return;
-    }
-
-    QVideoFrame copy(frame);
-    if (!copy.map(QAbstractVideoBuffer::ReadOnly)) {
-        return;
-    }
-
-    CapturedFrame captured;
-    captured.resolution = QSize(copy.width(), copy.height());
-    captured.pixelFormat = copy.pixelFormat();
-    captured.startTimeUs = copy.startTime();
-    captured.planeCount = copy.planeCount();
-
-    const int loopPlaneCount = captured.planeCount > 0 ? captured.planeCount : 1;
-    const int mappedBytesTotal = copy.mappedBytes();
-    for (int p = 0; p < loopPlaneCount; ++p) {
-        captured.bytesPerLines.push_back(copy.bytesPerLine(p));
-        captured.mappedBytesPerPlane.push_back(p == 0 ? mappedBytesTotal : -1);
-    }
-
-    const uchar *bits = copy.bits();
-    if (mappedBytesTotal > 0 && bits) {
-        captured.payload.append(reinterpret_cast<const char *>(bits), mappedBytesTotal);
-    }
-
-    copy.unmap();
-
-    if (captured.payload.isEmpty()) {
-        return;
-    }
-
-    CameraModeInfo liveMode;
-    QString modeReason;
-    if (m_useManualPreviewMode) {
-        liveMode = m_manualPreviewMode;
-    } else if (!findDefaultLiveYuyvMode(liveMode, &modeReason)) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Drop raw live frame: ") + modeReason);
+    if (frame.payload.isEmpty()) {
         return;
     }
 
     QByteArray payload;
     QString reason;
-    const QSize expectedResolution = liveMode.settings.resolution();
-    if (!normalizeLiveYuyvFrame(captured, expectedResolution, payload, &reason)) {
+    const QSize expectedResolution = m_hasAcceptedPreviewMode
+            ? m_acceptedPreviewMode.resolution
+            : m_manualPreviewMode.resolution;
+    if (!normalizeLiveYuyvFrame(frame, expectedResolution, payload, &reason)) {
         ui->plainTextEdit->appendPlainText(QStringLiteral("[WARN] Drop raw live frame: ") + reason);
         return;
     }
@@ -1351,6 +1162,9 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
         // 发送失败即停流，避免持续错误刷屏和驱动压力累积。
         m_liveVideoSending = false;
         m_liveSendStartMs = 0;
+        if (m_previewSession) {
+            m_previewSession->setRawFrameDeliveryEnabled(false);
+        }
         clearLiveVideoBuffers();
         ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+批量)"));
         ui->plainTextEdit->appendPlainText(

@@ -13,12 +13,14 @@ Camera_PC/
 ├── load_xdma.sh
 ├── include/
 │   ├── cameraprobe.h
+│   ├── linuxpreviewsession.h
 │   ├── video_packet_batcher.h
 │   ├── widget.h
 │   └── xdmaDLL_public_linux.h
 └── src/
     ├── XDMA_MoreB_linux.cc
     ├── cameraprobe.cpp
+    ├── linuxpreviewsession.cpp
     ├── main.cpp
     ├── video_packet_batcher.cpp
     ├── widget.cpp
@@ -43,6 +45,8 @@ sudo apt install -y \
   build-essential cmake pkg-config \
   qtbase5-dev qtmultimedia5-dev qttools5-dev-tools \
   libqt5multimedia5-plugins libqt5multimediawidgets5 \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   v4l-utils \
   fonts-noto-cjk fonts-wqy-microhei fonts-wqy-zenhei
 ```
@@ -87,31 +91,25 @@ ls /dev/xdma*
 
 - `ready_state`、`reset` 返回值语义目前直接透传底层 XDMA 接口。
 - `op_state`、`ddr_state` 的寄存器语义仍需与 FPGA 文档最终对齐。
-Linux 枚举/预览方案
-可以做，而且建议不要继续依赖 Qt 的 QCameraViewfinderSettings 作为唯一模式来源。Linux 侧建议新增一个 V4L2/GStreamer 预览会话，结构对齐 Win 的 DirectShow session：
 
-用 V4L2 直接枚举设备：
+## Linux 预览链路
 
-VIDIOC_ENUM_FMT
-VIDIOC_ENUM_FRAMESIZES
-VIDIOC_ENUM_FRAMEINTERVALS
-对 DISCRETE 帧率列出具体 fps。
-对 STEPWISE/CONTINUOUS 只显示范围/步进，不能伪造成确定支持的离散 fps。
-应用模式时用 V4L2 精确请求：
+Linux 实时预览使用 `LinuxPreviewSession`，不再依赖 Qt `QCameraViewfinder` / `QVideoProbe`：
 
-VIDIOC_S_FMT 设置宽高和 YUYV/MJPG。
-VIDIOC_S_PARM 设置 timeperframe。
-再用 VIDIOC_G_FMT、VIDIOC_G_PARM 读取驱动实际接受的分辨率和帧率。
-如果驱动调整了参数，UI 日志明确显示 requested 和 accepted 的差异。
-预览建议用 GStreamer：
+```text
+V4L2 枚举/设置模式
+  -> GStreamer v4l2src + capsfilter(YUY2) + tee
+     -> native video sink 预览
+     -> appsink raw YUYV callback
+        -> VideoPacketBatcher
+        -> XDMA h2c_0
+```
 
-v4l2src ! capsfilter ! tee
-一路到 native video sink 做预览，比如 xvimagesink/waylandsink/ximagesink fallback。
-一路到 appsink 拿 raw YUYV callback，继续走现有 XDMA 发送链路。
-预览窗口 resize 只改 sink 显示区域，不改采集分辨率和帧率。
-UI 显示实际状态：
+模式选择规则：
 
-显示 requested mode：用户选择的模式。
-显示 accepted mode：V4L2 实际接受的宽高/格式/fps。
-显示 measured fps：appsink/raw callback 按 1 秒滑动窗口统计出来的真实到帧率。
-这样 Linux 可以做到和 Win 类似：模式从驱动枚举来，应用后读取实际接受值，预览和 raw callback 双分支，XDMA 协议保持不变。
+- 只把 V4L2 `DISCRETE` 的 `YUYV/YUY2` 模式加入下拉框。
+- `STEPWISE/CONTINUOUS` 帧率只写日志，不作为确定 fps 选项展示。
+- 应用模式时先请求 `VIDIOC_S_FMT` / `VIDIOC_S_PARM`，再读取 `VIDIOC_G_FMT` / `VIDIOC_G_PARM`。
+- UI 日志会分别显示 requested mode 和 driver accepted mode；如果驱动接受的格式或分辨率不是请求值，预览会拒绝启动。
+
+`采一帧` 仍暂时保留 Qt `CameraProbe` 路径，和实时预览/实时发送链路解耦。

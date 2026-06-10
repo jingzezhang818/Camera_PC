@@ -4,3 +4,7 @@ build/
 
 frame_*.raw
 frame_*.png
+
+loongnix20_debs/
+loongnix20_gstreamer_dev_debs/
+loongnix20_gstreamer_dev_*.tar.gz

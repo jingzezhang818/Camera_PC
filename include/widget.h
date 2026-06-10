@@ -8,13 +8,11 @@
 // - 负责 UI 交互与日志输出。
 
 #include <QWidget>
-#include <QCamera>
-#include <QCameraViewfinder>
-#include <QVideoProbe>
 #include <QByteArray>
 #include <QList>
 #include <QVector>
 #include "cameraprobe.h"
+#include "linuxpreviewsession.h"
 #include "video_packet_batcher.h"
 
 class QSpinBox;
@@ -51,13 +49,15 @@ private slots:
     void onProbeSuccess(const CapturedFrame &frame);
     void onProbeFailed(const QString &reason);
 
-    // ===== 回调槽：预览链路 =====
-    void onPreviewCameraError(QCamera::Error error);
-    void onPreviewFrameProbed(const QVideoFrame &frame);
+    // ===== 回调槽：Linux 预览链路 =====
+    void onPreviewLog(const QString &msg);
+    void onAcceptedPreviewModeChanged(const LinuxAcceptedMode &mode);
+    void onRawPreviewFrameAvailable(const CapturedFrame &frame);
+    void onRawPreviewFrameFailed(const QString &reason);
 
 private:
     // ===== 模块：生命周期与预览初始化 =====
-    // 初始化实时预览（QCameraViewfinder + QVideoProbe）。
+    // 初始化实时预览（Linux V4L2 + GStreamer PreviewSession）。
     void initializePreview();
 
     // 初始化“节流间隔/写入大小”调参控件，并绑定运行时参数。
@@ -67,7 +67,7 @@ private:
     // 该区域是“寄存器调试入口”，与视频发送链路解耦。
     void initializeAxiLiteControls();
 
-    // 启动/停止实时预览相机。
+    // 启动/停止 Linux 实时预览。
     void startPreview();
     void stopPreview();
     void refreshModeCombo();
@@ -75,7 +75,6 @@ private:
     void stopLiveVideoSending(const QString &reason = QString());
     void clearLiveVideoBuffers();
     bool selectedModeSupportsLiveStreaming(QString *reason = nullptr) const;
-    bool findDefaultLiveYuyvMode(CameraModeInfo &outMode, QString *report) const;
     bool normalizeLiveYuyvFrame(const CapturedFrame &frame,
                                 const QSize &expectedResolution,
                                 QByteArray &payload,
@@ -131,14 +130,15 @@ private:
     CameraProbe *m_probe = nullptr;
 
     // 实时预览链路对象。
-    QCamera *m_previewCamera = nullptr;
-    QCameraViewfinder *m_viewfinder = nullptr;
-    QVideoProbe *m_videoProbe = nullptr;
+    LinuxPreviewSession *m_previewSession = nullptr;
+    QWidget *m_previewWidget = nullptr;
     QComboBox *m_modeCombo = nullptr;
     QPushButton *m_applyModeBtn = nullptr;
-    QList<CameraModeInfo> m_availableModes;
+    QList<LinuxPreviewMode> m_availablePreviewModes;
     bool m_useManualPreviewMode = false;
-    CameraModeInfo m_manualPreviewMode;
+    LinuxPreviewMode m_manualPreviewMode;
+    LinuxAcceptedMode m_acceptedPreviewMode;
+    bool m_hasAcceptedPreviewMode = false;
 
     // 抓取单帧前会暂停预览，抓取结束后根据该标记恢复。
     bool m_restartPreviewAfterCapture = false;
