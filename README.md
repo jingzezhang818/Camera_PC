@@ -47,6 +47,7 @@ sudo apt install -y \
   libqt5multimedia5-plugins libqt5multimediawidgets5 \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-x gstreamer1.0-plugins-bad \
   v4l-utils \
   fonts-noto-cjk fonts-wqy-microhei fonts-wqy-zenhei
 ```
@@ -111,5 +112,17 @@ V4L2 枚举/设置模式
 - `STEPWISE/CONTINUOUS` 帧率只写日志，不作为确定 fps 选项展示。
 - 应用模式时先请求 `VIDIOC_S_FMT` / `VIDIOC_S_PARM`，再读取 `VIDIOC_G_FMT` / `VIDIOC_G_PARM`。
 - UI 日志会分别显示 requested mode 和 driver accepted mode；如果驱动接受的格式或分辨率不是请求值，预览会拒绝启动。
+- 预览 sink 会依次尝试 `ximagesink`、`waylandsink`、`xvimagesink`、`glimagesink`、`autovideosink`；如果显示 sink 都无法进入 `PLAYING`，最后会用 `fakesink` 保住 raw appsink/XDMA 链路，并在日志中提示预览画面为空。
 
 `采一帧` 仍暂时保留 Qt `CameraProbe` 路径，和实时预览/实时发送链路解耦。
+
+如果龙芯机器出现 `failed to set GStreamer pipeline to PLAYING`，先看程序日志里的 `[GST][WARN] sink=...` 和 `[GST][ERROR] source=...`。也可以用下面命令单独验证插件和摄像头链路，分辨是显示 sink 失败还是 V4L2/caps 协商失败：
+
+```bash
+gst-inspect-1.0 v4l2src appsink videoconvert ximagesink xvimagesink autovideosink fakesink
+
+# 把 /dev/video0、分辨率和帧率替换成 UI 日志里的 accepted mode
+gst-launch-1.0 -v v4l2src device=/dev/video0 ! \
+  "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1" ! \
+  videoconvert ! ximagesink
+```

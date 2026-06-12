@@ -82,25 +82,103 @@ QString modeSummary(const QString &devicePath,
             .arg(fpsFromTimePerFrame(fpsNumerator, fpsDenominator), 0, 'f', 3);
 }
 
-GstElement *makeFirstAvailableSink(QString *name)
+QStringList videoSinkFactoryCandidates()
 {
-    const char *candidates[] = {
-        "xvimagesink",
-        "ximagesink",
-        "waylandsink",
-        "autovideosink"
+    return QStringList {
+        QStringLiteral("ximagesink"),
+        QStringLiteral("waylandsink"),
+        QStringLiteral("xvimagesink"),
+        QStringLiteral("glimagesink"),
+        QStringLiteral("autovideosink"),
+        QStringLiteral("fakesink")
     };
+}
 
-    for (const char *candidate : candidates) {
-        GstElement *sink = gst_element_factory_make(candidate, "preview_sink");
-        if (sink) {
-            if (name) {
-                *name = QString::fromLatin1(candidate);
-            }
-            return sink;
-        }
+void unrefElement(GstElement *element)
+{
+    if (element) {
+        gst_object_unref(element);
     }
-    return nullptr;
+}
+
+bool hasGObjectProperty(GObject *object, const char *propertyName)
+{
+    return object && g_object_class_find_property(G_OBJECT_GET_CLASS(object), propertyName);
+}
+
+void setBoolPropertyIfPresent(GstElement *element, const char *propertyName, gboolean value)
+{
+    if (hasGObjectProperty(G_OBJECT(element), propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
+QString messageSourceName(GstMessage *message)
+{
+    if (!message || !message->src) {
+        return QStringLiteral("unknown");
+    }
+    return QString::fromLatin1(GST_OBJECT_NAME(message->src));
+}
+
+QString formatGstErrorMessage(GstMessage *message)
+{
+    GError *error = nullptr;
+    gchar *debug = nullptr;
+    gst_message_parse_error(message, &error, &debug);
+    const QString text = QString("[GST][ERROR] source=%1 message=%2%3")
+            .arg(messageSourceName(message))
+            .arg(error ? QString::fromUtf8(error->message) : QStringLiteral("unknown error"))
+            .arg(debug ? QString(" debug=%1").arg(QString::fromUtf8(debug)) : QString());
+    if (error) {
+        g_error_free(error);
+    }
+    if (debug) {
+        g_free(debug);
+    }
+    return text;
+}
+
+QString formatGstWarningMessage(GstMessage *message)
+{
+    GError *error = nullptr;
+    gchar *debug = nullptr;
+    gst_message_parse_warning(message, &error, &debug);
+    const QString text = QString("[GST][WARN] source=%1 message=%2%3")
+            .arg(messageSourceName(message))
+            .arg(error ? QString::fromUtf8(error->message) : QStringLiteral("unknown warning"))
+            .arg(debug ? QString(" debug=%1").arg(QString::fromUtf8(debug)) : QString());
+    if (error) {
+        g_error_free(error);
+    }
+    if (debug) {
+        g_free(debug);
+    }
+    return text;
+}
+
+QString drainStartupBusDiagnostics(GstElement *pipeline)
+{
+    GstBus *bus = gst_element_get_bus(pipeline);
+    if (!bus) {
+        return QString();
+    }
+
+    QStringList diagnostics;
+    const auto mask = static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING);
+    GstMessage *message = gst_bus_timed_pop_filtered(bus, 250 * GST_MSECOND, mask);
+    while (message) {
+        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+            diagnostics << formatGstErrorMessage(message);
+        } else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_WARNING) {
+            diagnostics << formatGstWarningMessage(message);
+        }
+        gst_message_unref(message);
+        message = gst_bus_pop_filtered(bus, mask);
+    }
+
+    gst_object_unref(bus);
+    return diagnostics.join(QStringLiteral("; "));
 }
 
 void appendIntervalLog(QStringList *logLines,
@@ -490,141 +568,182 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
         accepted = m_acceptedMode;
     }
 
-    GstElement *pipeline = gst_pipeline_new("linux_preview_pipeline");
-    GstElement *source = gst_element_factory_make("v4l2src", "source");
-    GstElement *capsFilter = gst_element_factory_make("capsfilter", "capsfilter");
-    GstElement *tee = gst_element_factory_make("tee", "tee");
-    GstElement *previewQueue = gst_element_factory_make("queue", "preview_queue");
-    GstElement *rawQueue = gst_element_factory_make("queue", "raw_queue");
-    GstElement *convert = gst_element_factory_make("videoconvert", "preview_convert");
-    QString sinkName;
-    GstElement *videoSink = makeFirstAvailableSink(&sinkName);
-    GstElement *appSink = gst_element_factory_make("appsink", "raw_sink");
+    QStringList startupFailures;
+    for (const QString &sinkName : videoSinkFactoryCandidates()) {
+        GstElement *pipeline = gst_pipeline_new("linux_preview_pipeline");
+        GstElement *source = gst_element_factory_make("v4l2src", "source");
+        GstElement *capsFilter = gst_element_factory_make("capsfilter", "capsfilter");
+        GstElement *tee = gst_element_factory_make("tee", "tee");
+        GstElement *previewQueue = gst_element_factory_make("queue", "preview_queue");
+        GstElement *rawQueue = gst_element_factory_make("queue", "raw_queue");
+        GstElement *convert = gst_element_factory_make("videoconvert", "preview_convert");
+        const QByteArray sinkFactory = sinkName.toLatin1();
+        GstElement *videoSink = gst_element_factory_make(sinkFactory.constData(), "preview_sink");
+        GstElement *appSink = gst_element_factory_make("appsink", "raw_sink");
 
-    if (!pipeline || !source || !capsFilter || !tee || !previewQueue ||
-        !rawQueue || !convert || !videoSink || !appSink) {
-        if (reason) {
-            *reason = QStringLiteral("failed to create one or more GStreamer elements");
+        if (!videoSink) {
+            startupFailures << QString("%1: element factory is not available").arg(sinkName);
+            unrefElement(pipeline);
+            unrefElement(source);
+            unrefElement(capsFilter);
+            unrefElement(tee);
+            unrefElement(previewQueue);
+            unrefElement(rawQueue);
+            unrefElement(convert);
+            unrefElement(appSink);
+            continue;
         }
-        if (pipeline) {
-            gst_object_unref(pipeline);
+
+        if (!pipeline || !source || !capsFilter || !tee || !previewQueue ||
+            !rawQueue || !convert || !appSink) {
+            if (reason) {
+                *reason = QStringLiteral("failed to create one or more required GStreamer elements");
+            }
+            unrefElement(pipeline);
+            unrefElement(source);
+            unrefElement(capsFilter);
+            unrefElement(tee);
+            unrefElement(previewQueue);
+            unrefElement(rawQueue);
+            unrefElement(convert);
+            unrefElement(videoSink);
+            unrefElement(appSink);
+            return false;
         }
-        return false;
-    }
 
-    g_object_set(source, "device", mode.devicePath.toLocal8Bit().constData(), nullptr);
-    g_object_set(previewQueue, "leaky", 2, "max-size-buffers", 2, nullptr);
-    g_object_set(rawQueue, "leaky", 2, "max-size-buffers", 2, nullptr);
-    g_object_set(appSink,
-                 "emit-signals", TRUE,
-                 "sync", FALSE,
-                 "max-buffers", 2,
-                 "drop", TRUE,
-                 nullptr);
-
-    GstCaps *caps = nullptr;
-    if (accepted.fpsNumerator > 0 && accepted.fpsDenominator > 0) {
-        caps = gst_caps_new_simple("video/x-raw",
-                                   "format", G_TYPE_STRING, "YUY2",
-                                   "width", G_TYPE_INT, accepted.resolution.width(),
-                                   "height", G_TYPE_INT, accepted.resolution.height(),
-                                   "framerate", GST_TYPE_FRACTION,
-                                   accepted.fpsDenominator,
-                                   accepted.fpsNumerator,
-                                   nullptr);
-    } else {
-        caps = gst_caps_new_simple("video/x-raw",
-                                   "format", G_TYPE_STRING, "YUY2",
-                                   "width", G_TYPE_INT, accepted.resolution.width(),
-                                   "height", G_TYPE_INT, accepted.resolution.height(),
-                                   nullptr);
-    }
-    g_object_set(capsFilter, "caps", caps, nullptr);
-    gst_caps_unref(caps);
-
-    gst_bin_add_many(GST_BIN(pipeline),
-                     source,
-                     capsFilter,
-                     tee,
-                     previewQueue,
-                     convert,
-                     videoSink,
-                     rawQueue,
-                     appSink,
+        g_object_set(source, "device", mode.devicePath.toLocal8Bit().constData(), nullptr);
+        g_object_set(previewQueue, "leaky", 2, "max-size-buffers", 2, nullptr);
+        g_object_set(rawQueue, "leaky", 2, "max-size-buffers", 2, nullptr);
+        g_object_set(appSink,
+                     "emit-signals", TRUE,
+                     "sync", FALSE,
+                     "max-buffers", 2,
+                     "drop", TRUE,
                      nullptr);
 
-    const bool fixedLinksOk =
-            gst_element_link_many(source, capsFilter, tee, nullptr) &&
-            gst_element_link_many(previewQueue, convert, videoSink, nullptr) &&
-            gst_element_link_many(rawQueue, appSink, nullptr);
-    if (!fixedLinksOk) {
-        if (reason) {
-            *reason = QStringLiteral("failed to link fixed GStreamer elements");
+        setBoolPropertyIfPresent(videoSink, "sync", FALSE);
+        setBoolPropertyIfPresent(videoSink, "async", FALSE);
+        setBoolPropertyIfPresent(videoSink, "enable-last-sample", FALSE);
+
+        GstCaps *caps = nullptr;
+        if (accepted.fpsNumerator > 0 && accepted.fpsDenominator > 0) {
+            caps = gst_caps_new_simple("video/x-raw",
+                                       "format", G_TYPE_STRING, "YUY2",
+                                       "width", G_TYPE_INT, accepted.resolution.width(),
+                                       "height", G_TYPE_INT, accepted.resolution.height(),
+                                       "framerate", GST_TYPE_FRACTION,
+                                       accepted.fpsDenominator,
+                                       accepted.fpsNumerator,
+                                       nullptr);
+        } else {
+            caps = gst_caps_new_simple("video/x-raw",
+                                       "format", G_TYPE_STRING, "YUY2",
+                                       "width", G_TYPE_INT, accepted.resolution.width(),
+                                       "height", G_TYPE_INT, accepted.resolution.height(),
+                                       nullptr);
         }
-        gst_object_unref(pipeline);
-        return false;
-    }
+        g_object_set(capsFilter, "caps", caps, nullptr);
+        gst_caps_unref(caps);
 
-    GstPad *teePreviewPad = gst_element_get_request_pad(tee, "src_%u");
-    GstPad *teeRawPad = gst_element_get_request_pad(tee, "src_%u");
-    GstPad *previewSinkPad = gst_element_get_static_pad(previewQueue, "sink");
-    GstPad *rawSinkPad = gst_element_get_static_pad(rawQueue, "sink");
-    const bool teeLinksOk =
-            teePreviewPad && teeRawPad && previewSinkPad && rawSinkPad &&
-            gst_pad_link(teePreviewPad, previewSinkPad) == GST_PAD_LINK_OK &&
-            gst_pad_link(teeRawPad, rawSinkPad) == GST_PAD_LINK_OK;
-    if (teePreviewPad) {
-        gst_object_unref(teePreviewPad);
-    }
-    if (teeRawPad) {
-        gst_object_unref(teeRawPad);
-    }
-    if (previewSinkPad) {
-        gst_object_unref(previewSinkPad);
-    }
-    if (rawSinkPad) {
-        gst_object_unref(rawSinkPad);
-    }
+        gst_bin_add_many(GST_BIN(pipeline),
+                         source,
+                         capsFilter,
+                         tee,
+                         previewQueue,
+                         convert,
+                         videoSink,
+                         rawQueue,
+                         appSink,
+                         nullptr);
 
-    if (!teeLinksOk) {
-        if (reason) {
-            *reason = QStringLiteral("failed to link GStreamer tee pads");
+        const bool fixedLinksOk =
+                gst_element_link_many(source, capsFilter, tee, nullptr) &&
+                gst_element_link_many(previewQueue, convert, videoSink, nullptr) &&
+                gst_element_link_many(rawQueue, appSink, nullptr);
+        if (!fixedLinksOk) {
+            const QString failure = QString("%1: failed to link fixed GStreamer elements").arg(sinkName);
+            startupFailures << failure;
+            emit logMessage(QStringLiteral("[GST][WARN] ") + failure);
+            gst_object_unref(pipeline);
+            continue;
         }
-        gst_object_unref(pipeline);
-        return false;
-    }
 
-    if (GST_IS_VIDEO_OVERLAY(videoSink)) {
-        gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videoSink),
-                                            static_cast<guintptr>(previewWidget->winId()));
-    } else {
-        emit logMessage(QString("[GST][WARN] selected sink %1 does not implement GstVideoOverlay; preview may open in a separate window.")
-                        .arg(sinkName));
-    }
-
-    g_signal_connect(appSink, "new-sample", G_CALLBACK(&LinuxPreviewSession::onNewSample), this);
-
-    m_pipeline = pipeline;
-    m_appSink = appSink;
-    m_videoSink = videoSink;
-
-    const GstStateChangeReturn stateRet = gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
-    if (stateRet == GST_STATE_CHANGE_FAILURE) {
-        if (reason) {
-            *reason = QStringLiteral("failed to set GStreamer pipeline to PLAYING");
+        GstPad *teePreviewPad = gst_element_get_request_pad(tee, "src_%u");
+        GstPad *teeRawPad = gst_element_get_request_pad(tee, "src_%u");
+        GstPad *previewSinkPad = gst_element_get_static_pad(previewQueue, "sink");
+        GstPad *rawSinkPad = gst_element_get_static_pad(rawQueue, "sink");
+        const bool teeLinksOk =
+                teePreviewPad && teeRawPad && previewSinkPad && rawSinkPad &&
+                gst_pad_link(teePreviewPad, previewSinkPad) == GST_PAD_LINK_OK &&
+                gst_pad_link(teeRawPad, rawSinkPad) == GST_PAD_LINK_OK;
+        if (teePreviewPad) {
+            gst_object_unref(teePreviewPad);
         }
-        releasePipeline();
-        return false;
+        if (teeRawPad) {
+            gst_object_unref(teeRawPad);
+        }
+        if (previewSinkPad) {
+            gst_object_unref(previewSinkPad);
+        }
+        if (rawSinkPad) {
+            gst_object_unref(rawSinkPad);
+        }
+
+        if (!teeLinksOk) {
+            const QString failure = QString("%1: failed to link GStreamer tee pads").arg(sinkName);
+            startupFailures << failure;
+            emit logMessage(QStringLiteral("[GST][WARN] ") + failure);
+            gst_object_unref(pipeline);
+            continue;
+        }
+
+        if (GST_IS_VIDEO_OVERLAY(videoSink)) {
+            gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videoSink),
+                                                static_cast<guintptr>(previewWidget->winId()));
+        } else if (sinkName != QStringLiteral("fakesink")) {
+            emit logMessage(QString("[GST][WARN] selected sink %1 does not implement GstVideoOverlay; preview may open in a separate window.")
+                            .arg(sinkName));
+        }
+
+        g_signal_connect(appSink, "new-sample", G_CALLBACK(&LinuxPreviewSession::onNewSample), this);
+
+        m_pipeline = pipeline;
+        m_appSink = appSink;
+        m_videoSink = videoSink;
+
+        emit logMessage(QString("[GST] Trying preview sink=%1").arg(sinkName));
+        const GstStateChangeReturn stateRet = gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
+        if (stateRet == GST_STATE_CHANGE_FAILURE) {
+            QString failure = QString("%1: failed to set GStreamer pipeline to PLAYING").arg(sinkName);
+            const QString diagnostics = drainStartupBusDiagnostics(m_pipeline);
+            if (!diagnostics.isEmpty()) {
+                failure += QStringLiteral(" (") + diagnostics + QStringLiteral(")");
+            }
+            startupFailures << failure;
+            emit logMessage(QStringLiteral("[GST][WARN] ") + failure);
+            releasePipeline();
+            continue;
+        }
+
+        m_busTimer.start();
+        emit logMessage(QString("[GST] Selected preview sink=%1").arg(sinkName));
+        if (sinkName == QStringLiteral("fakesink")) {
+            emit logMessage(QStringLiteral("[GST][WARN] No real video sink reached PLAYING; using fakesink so raw appsink/live XDMA can still run. The embedded preview will be blank."));
+        }
+        emit logMessage(QString("[GST] Requested pipeline: v4l2src device=%1 ! video/x-raw,format=YUY2,width=%2,height=%3,framerate=%4/%5 ! tee")
+                        .arg(mode.devicePath)
+                        .arg(accepted.resolution.width())
+                        .arg(accepted.resolution.height())
+                        .arg(accepted.fpsDenominator)
+                        .arg(accepted.fpsNumerator));
+        return true;
     }
 
-    m_busTimer.start();
-    emit logMessage(QString("[GST] Requested pipeline: v4l2src device=%1 ! video/x-raw,format=YUY2,width=%2,height=%3,framerate=%4/%5 ! tee")
-                    .arg(mode.devicePath)
-                    .arg(accepted.resolution.width())
-                    .arg(accepted.resolution.height())
-                    .arg(accepted.fpsDenominator)
-                    .arg(accepted.fpsNumerator));
-    return true;
+    if (reason) {
+        *reason = QString("failed to set GStreamer pipeline to PLAYING with all preview sinks: %1")
+                .arg(startupFailures.join(QStringLiteral(" | ")));
+    }
+    return false;
 }
 
 void LinuxPreviewSession::releasePipeline()
@@ -664,35 +783,12 @@ void LinuxPreviewSession::pollBus()
                                            GST_MESSAGE_EOS))) {
         switch (GST_MESSAGE_TYPE(message)) {
         case GST_MESSAGE_ERROR: {
-            GError *error = nullptr;
-            gchar *debug = nullptr;
-            gst_message_parse_error(message, &error, &debug);
-            const QString text = QString("[GST][ERROR] %1%2")
-                    .arg(error ? QString::fromUtf8(error->message) : QStringLiteral("unknown error"))
-                    .arg(debug ? QString(" debug=%1").arg(QString::fromUtf8(debug)) : QString());
-            emit rawFrameFailed(text);
-            if (error) {
-                g_error_free(error);
-            }
-            if (debug) {
-                g_free(debug);
-            }
+            emit rawFrameFailed(formatGstErrorMessage(message));
             shouldStop = true;
             break;
         }
         case GST_MESSAGE_WARNING: {
-            GError *error = nullptr;
-            gchar *debug = nullptr;
-            gst_message_parse_warning(message, &error, &debug);
-            emit logMessage(QString("[GST][WARN] %1%2")
-                            .arg(error ? QString::fromUtf8(error->message) : QStringLiteral("unknown warning"))
-                            .arg(debug ? QString(" debug=%1").arg(QString::fromUtf8(debug)) : QString()));
-            if (error) {
-                g_error_free(error);
-            }
-            if (debug) {
-                g_free(debug);
-            }
+            emit logMessage(formatGstWarningMessage(message));
             break;
         }
         case GST_MESSAGE_EOS:
