@@ -1,3 +1,6 @@
+# Copyright (c) 2026 jingzezhang818.
+# All rights reserved.
+
 cmake_minimum_required(VERSION 3.13)
 project(camera_pc_linux_gui LANGUAGES CXX)
 

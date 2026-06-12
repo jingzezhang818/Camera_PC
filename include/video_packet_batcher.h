@@ -1,3 +1,6 @@
+// Copyright (c) 2026 jingzezhang818.
+// All rights reserved.
+
 #ifndef VIDEO_PACKET_BATCHER_H
 #define VIDEO_PACKET_BATCHER_H
 

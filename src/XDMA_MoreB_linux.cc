@@ -1,3 +1,6 @@
+// Copyright (c) 2026 jingzezhang818.
+// All rights reserved.
+
 #include "xdmaDLL_public_linux.h"
 
 #include <ctype.h>

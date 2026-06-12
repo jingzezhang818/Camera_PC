@@ -1,3 +1,6 @@
+// Copyright (c) 2026 jingzezhang818.
+// All rights reserved.
+
 #include "video_packet_batcher.h"
 
 #include <QStringList>

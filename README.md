@@ -27,9 +27,51 @@ Camera_PC/
     └── widget.ui
 ```
 
+## 编译运行依赖
+
+项目使用 CMake + Qt5 Widgets + Qt5 Multimedia + GStreamer + V4L2。不同 Linux 发行版包名可能略有差异，下面以 Ubuntu/Debian 系为例。
+
+### 必需依赖包
+
+| 类型 | 依赖包 |
+| --- | --- |
+| C/C++ 构建工具 | `build-essential`、`cmake`、`pkg-config` |
+| Qt5 开发包 | `qtbase5-dev`、`qtbase5-dev-tools`、`qttools5-dev-tools`、`qtmultimedia5-dev` |
+| Qt5 运行插件 | `libqt5multimedia5`、`libqt5multimediawidgets5`、`libqt5multimedia5-plugins`、`libqt5multimediagsttools5` |
+| GStreamer 开发包 | `libgstreamer1.0-dev`、`libgstreamer-plugins-base1.0-dev`、`libglib2.0-dev` |
+| GStreamer 运行插件 | `gstreamer1.0-tools`、`gstreamer1.0-plugins-base`、`gstreamer1.0-plugins-good`、`gstreamer1.0-plugins-bad`、`gstreamer1.0-x` |
+| V4L2 工具/运行库 | `v4l-utils`、`libv4l-0` |
+| 中文字体 | `fonts-noto-cjk`、`fonts-wqy-microhei`、`fonts-wqy-zenhei` |
+
+一条命令安装：
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential cmake pkg-config \
+  qtbase5-dev qtbase5-dev-tools qttools5-dev-tools qtmultimedia5-dev \
+  libqt5multimedia5 libqt5multimediawidgets5 libqt5multimedia5-plugins \
+  libqt5multimediagsttools5 \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-x \
+  v4l-utils libv4l-0 \
+  fonts-noto-cjk fonts-wqy-microhei fonts-wqy-zenhei
+```
+
+### 依赖说明
+
+- `Qt5::Widgets`：主界面、按钮、日志窗口和参数控件。
+- `Qt5::Multimedia` / `Qt5::MultimediaWidgets`：保留的单帧抓取路径。
+- `GStreamer`：Linux 实时预览、双 FPS 统计、raw YUYV appsink 数据链路。
+- `gstreamer1.0-x`：提供 `ximagesink` / `xvimagesink` 等 X11 预览 sink。
+- `gstreamer1.0-plugins-bad`：部分平台上的 `fpsdisplaysink` / GL sink 等插件可能来自该包。
+- `v4l-utils`：用于检查 `/dev/video*` 和摄像头支持的 V4L2 模式。
+- 中文字体包：避免中文按钮、日志和标签显示成方块。
+
 ## 快速开始
 
-### 1. 获取代码并切到 Linux 分支
+### 1. 获取代码
 
 ```bash
 git clone https://github.com/jingzezhang818/Camera_PC.git
@@ -37,29 +79,14 @@ cd Camera_PC
 git checkout linux-support
 ```
 
-### 2. 安装依赖（Ubuntu/WSL）
-
-```bash
-sudo apt update
-sudo apt install -y \
-  build-essential cmake pkg-config \
-  qtbase5-dev qtmultimedia5-dev qttools5-dev-tools \
-  libqt5multimedia5-plugins libqt5multimediawidgets5 \
-  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-  gstreamer1.0-x gstreamer1.0-plugins-bad \
-  v4l-utils \
-  fonts-noto-cjk fonts-wqy-microhei fonts-wqy-zenhei
-```
-
-### 3. 编译
+### 2. 编译
 
 ```bash
 cmake -S . -B build
 cmake --build build -j"$(nproc)"
 ```
 
-### 4. 加载 XDMA 驱动并运行 GUI
+### 3. 加载 XDMA 驱动并运行 GUI
 
 ```bash
 ./load_xdma.sh
@@ -83,8 +110,16 @@ cmake --build build -j"$(nproc)"
 ## 常用检查命令
 
 ```bash
+# 摄像头节点
 ls /dev/video*
 v4l2-ctl --list-devices
+v4l2-ctl --list-formats-ext -d /dev/video0
+
+# GStreamer 插件
+gst-inspect-1.0 v4l2src appsink videoconvert fpsdisplaysink \
+  ximagesink xvimagesink waylandsink glimagesink autovideosink fakesink
+
+# XDMA 节点
 ls /dev/xdma*
 ```
 

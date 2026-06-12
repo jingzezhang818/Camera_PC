@@ -1,3 +1,6 @@
+// Copyright (c) 2026 jingzezhang818.
+// All rights reserved.
+
 #ifndef WIDGET_H
 #define WIDGET_H
 
@@ -19,6 +22,7 @@ class QSpinBox;
 class QLineEdit;
 class QComboBox;
 class QPushButton;
+class QLabel;
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class Widget; }
@@ -52,6 +56,8 @@ private slots:
     // ===== 回调槽：Linux 预览链路 =====
     void onPreviewLog(const QString &msg);
     void onAcceptedPreviewModeChanged(const LinuxAcceptedMode &mode);
+    void onCaptureFpsUpdated(double fps);
+    void onRenderFpsUpdated(double fps);
     void onRawPreviewFrameAvailable(const CapturedFrame &frame);
     void onRawPreviewFrameFailed(const QString &reason);
 
@@ -70,6 +76,8 @@ private:
     // 启动/停止 Linux 实时预览。
     void startPreview();
     void stopPreview();
+    void resetFpsStatus();
+    void updateFpsStatusLabel();
     void refreshModeCombo();
     void applySelectedModeFromCombo();
     void stopLiveVideoSending(const QString &reason = QString());
@@ -134,11 +142,15 @@ private:
     QWidget *m_previewWidget = nullptr;
     QComboBox *m_modeCombo = nullptr;
     QPushButton *m_applyModeBtn = nullptr;
+    QLabel *m_fpsStatusLabel = nullptr;
     QList<LinuxPreviewMode> m_availablePreviewModes;
     bool m_useManualPreviewMode = false;
     LinuxPreviewMode m_manualPreviewMode;
     LinuxAcceptedMode m_acceptedPreviewMode;
     bool m_hasAcceptedPreviewMode = false;
+    double m_captureFps = -1.0;
+    double m_renderFps = -1.0;
+    double m_requestedFps = -1.0;
 
     // 抓取单帧前会暂停预览，抓取结束后根据该标记恢复。
     bool m_restartPreviewAfterCapture = false;

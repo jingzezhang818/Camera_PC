@@ -1,3 +1,6 @@
+// Copyright (c) 2026 jingzezhang818.
+// All rights reserved.
+
 #include "widget.h"
 #include "ui_widget.h"
 
@@ -134,6 +137,14 @@ QString modeToComboText(const LinuxPreviewMode &mode)
     return mode.displayText();
 }
 
+QString fpsDisplayText(double fps)
+{
+    if (fps < 0.0) {
+        return QStringLiteral("--");
+    }
+    return QString::number(fps, 'f', 1);
+}
+
 } // 匿名命名空间
 
 Widget::Widget(QWidget *parent)
@@ -190,6 +201,10 @@ void Widget::initializePreview()
             this, &Widget::onPreviewLog);
     connect(m_previewSession, &LinuxPreviewSession::acceptedModeChanged,
             this, &Widget::onAcceptedPreviewModeChanged);
+    connect(m_previewSession, &LinuxPreviewSession::captureFpsUpdated,
+            this, &Widget::onCaptureFpsUpdated);
+    connect(m_previewSession, &LinuxPreviewSession::renderFpsUpdated,
+            this, &Widget::onRenderFpsUpdated);
     connect(m_previewSession, &LinuxPreviewSession::rawFrameAvailable,
             this, &Widget::onRawPreviewFrameAvailable);
     connect(m_previewSession, &LinuxPreviewSession::rawFrameFailed,
@@ -215,10 +230,15 @@ void Widget::initializeModeControls()
     m_modeCombo = new QComboBox(panel);
     m_modeCombo->setMinimumWidth(360);
     m_applyModeBtn = new QPushButton(QString::fromWCharArray(L"\u5E94\u7528\u6A21\u5F0F"), panel);
+    m_fpsStatusLabel = new QLabel(panel);
+    m_fpsStatusLabel->setMinimumWidth(260);
+    m_fpsStatusLabel->setTextInteractionFlags(Qt::NoTextInteraction);
 
     row->addWidget(modeLabel);
     row->addWidget(m_modeCombo, 1);
     row->addWidget(m_applyModeBtn);
+    row->addSpacing(12);
+    row->addWidget(m_fpsStatusLabel);
 
     connect(m_applyModeBtn, &QPushButton::clicked,
             this, &Widget::applySelectedModeFromCombo);
@@ -228,6 +248,7 @@ void Widget::initializeModeControls()
     });
 
     ui->verticalLayout->insertWidget(2, panel);
+    resetFpsStatus();
     refreshModeCombo();
 }
 
@@ -546,6 +567,7 @@ void Widget::startPreview()
                 QString("[INFO] Preview requested mode: %1")
                 .arg(m_manualPreviewMode.displayText()));
 
+    resetFpsStatus();
     QString reason;
     if (!m_previewSession->start(m_manualPreviewMode, m_previewWidget, &reason)) {
         ui->plainTextEdit->appendPlainText(
@@ -560,6 +582,28 @@ void Widget::stopPreview()
     if (m_previewSession) {
         m_previewSession->stop();
     }
+    resetFpsStatus();
+}
+
+void Widget::resetFpsStatus()
+{
+    m_captureFps = -1.0;
+    m_renderFps = -1.0;
+    m_requestedFps = -1.0;
+    updateFpsStatusLabel();
+}
+
+void Widget::updateFpsStatusLabel()
+{
+    if (!m_fpsStatusLabel) {
+        return;
+    }
+
+    m_fpsStatusLabel->setText(
+                QString::fromUtf8("采集FPS: %1 | 预览FPS: %2 | 请求FPS: %3")
+                .arg(fpsDisplayText(m_captureFps))
+                .arg(fpsDisplayText(m_renderFps))
+                .arg(fpsDisplayText(m_requestedFps)));
 }
 
 void Widget::clearLiveVideoBuffers()
@@ -1105,9 +1149,23 @@ void Widget::onAcceptedPreviewModeChanged(const LinuxAcceptedMode &mode)
 {
     m_acceptedPreviewMode = mode;
     m_hasAcceptedPreviewMode = true;
+    m_requestedFps = mode.fps();
+    updateFpsStatusLabel();
     ui->plainTextEdit->appendPlainText(
                 QString("[INFO] Preview accepted mode: %1")
                 .arg(mode.displayText()));
+}
+
+void Widget::onCaptureFpsUpdated(double fps)
+{
+    m_captureFps = fps;
+    updateFpsStatusLabel();
+}
+
+void Widget::onRenderFpsUpdated(double fps)
+{
+    m_renderFps = fps;
+    updateFpsStatusLabel();
 }
 
 void Widget::onRawPreviewFrameFailed(const QString &reason)

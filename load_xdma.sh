@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 jingzezhang818.
+# All rights reserved.
+
 set -euo pipefail
 
 # Default to MSI mode(equivalent to ./load_driver.sh 1)

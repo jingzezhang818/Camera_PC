@@ -1,3 +1,6 @@
+// Copyright (c) 2026 jingzezhang818.
+// All rights reserved.
+
 #include "linuxpreviewsession.h"
 
 #include <QDir>
@@ -22,6 +25,7 @@
 namespace {
 
 constexpr quint32 kYuyvFourcc = V4L2_PIX_FMT_YUYV;
+constexpr qint64 kFpsUpdateIntervalMs = 1000;
 
 int xioctl(int fd, unsigned long request, void *arg)
 {
@@ -107,6 +111,20 @@ bool hasGObjectProperty(GObject *object, const char *propertyName)
 }
 
 void setBoolPropertyIfPresent(GstElement *element, const char *propertyName, gboolean value)
+{
+    if (hasGObjectProperty(G_OBJECT(element), propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
+void setIntPropertyIfPresent(GstElement *element, const char *propertyName, gint value)
+{
+    if (hasGObjectProperty(G_OBJECT(element), propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
+void setInt64PropertyIfPresent(GstElement *element, const char *propertyName, gint64 value)
 {
     if (hasGObjectProperty(G_OBJECT(element), propertyName)) {
         g_object_set(element, propertyName, value, nullptr);
@@ -402,6 +420,9 @@ bool LinuxPreviewSession::start(const LinuxPreviewMode &mode,
                                 QString *reason)
 {
     stop();
+    resetFpsCounters();
+    emit captureFpsUpdated(-1.0);
+    emit renderFpsUpdated(-1.0);
 
     if (!mode.isValid()) {
         if (reason) {
@@ -446,6 +467,9 @@ void LinuxPreviewSession::stop()
 {
     m_rawDeliveryEnabled.store(false);
     releasePipeline();
+    resetFpsCounters();
+    emit captureFpsUpdated(-1.0);
+    emit renderFpsUpdated(-1.0);
 }
 
 bool LinuxPreviewSession::isRunning() const
@@ -569,6 +593,7 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
     }
 
     QStringList startupFailures;
+    bool fpsDisplayUnavailableLogged = false;
     for (const QString &sinkName : videoSinkFactoryCandidates()) {
         GstElement *pipeline = gst_pipeline_new("linux_preview_pipeline");
         GstElement *source = gst_element_factory_make("v4l2src", "source");
@@ -579,6 +604,7 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
         GstElement *convert = gst_element_factory_make("videoconvert", "preview_convert");
         const QByteArray sinkFactory = sinkName.toLatin1();
         GstElement *videoSink = gst_element_factory_make(sinkFactory.constData(), "preview_sink");
+        GstElement *fpsDisplaySink = nullptr;
         GstElement *appSink = gst_element_factory_make("appsink", "raw_sink");
 
         if (!videoSink) {
@@ -594,6 +620,14 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
             continue;
         }
 
+        if (sinkName != QStringLiteral("fakesink")) {
+            fpsDisplaySink = gst_element_factory_make("fpsdisplaysink", "preview_fps_sink");
+            if (!fpsDisplaySink && !fpsDisplayUnavailableLogged) {
+                emit logMessage(QStringLiteral("[GST][WARN] fpsdisplaysink is unavailable; preview FPS uses pad-probe fallback."));
+                fpsDisplayUnavailableLogged = true;
+            }
+        }
+
         if (!pipeline || !source || !capsFilter || !tee || !previewQueue ||
             !rawQueue || !convert || !appSink) {
             if (reason) {
@@ -607,6 +641,7 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
             unrefElement(rawQueue);
             unrefElement(convert);
             unrefElement(videoSink);
+            unrefElement(fpsDisplaySink);
             unrefElement(appSink);
             return false;
         }
@@ -623,7 +658,20 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
 
         setBoolPropertyIfPresent(videoSink, "sync", FALSE);
         setBoolPropertyIfPresent(videoSink, "async", FALSE);
+        setBoolPropertyIfPresent(videoSink, "qos", FALSE);
         setBoolPropertyIfPresent(videoSink, "enable-last-sample", FALSE);
+        setInt64PropertyIfPresent(videoSink, "max-lateness", -1);
+        if (fpsDisplaySink) {
+            g_object_set(fpsDisplaySink, "video-sink", videoSink, nullptr);
+            setBoolPropertyIfPresent(fpsDisplaySink, "text-overlay", FALSE);
+            setBoolPropertyIfPresent(fpsDisplaySink, "signal-fps-measurements", TRUE);
+            setBoolPropertyIfPresent(fpsDisplaySink, "sync", FALSE);
+            setBoolPropertyIfPresent(fpsDisplaySink, "async", FALSE);
+            setBoolPropertyIfPresent(fpsDisplaySink, "qos", FALSE);
+            setInt64PropertyIfPresent(fpsDisplaySink, "max-lateness", -1);
+            setIntPropertyIfPresent(fpsDisplaySink, "fps-update-interval",
+                                    static_cast<gint>(kFpsUpdateIntervalMs));
+        }
 
         GstCaps *caps = nullptr;
         if (accepted.fpsNumerator > 0 && accepted.fpsDenominator > 0) {
@@ -645,20 +693,21 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
         g_object_set(capsFilter, "caps", caps, nullptr);
         gst_caps_unref(caps);
 
+        GstElement *previewTerminal = fpsDisplaySink ? fpsDisplaySink : videoSink;
         gst_bin_add_many(GST_BIN(pipeline),
                          source,
                          capsFilter,
                          tee,
                          previewQueue,
                          convert,
-                         videoSink,
+                         previewTerminal,
                          rawQueue,
                          appSink,
                          nullptr);
 
         const bool fixedLinksOk =
                 gst_element_link_many(source, capsFilter, tee, nullptr) &&
-                gst_element_link_many(previewQueue, convert, videoSink, nullptr) &&
+                gst_element_link_many(previewQueue, convert, previewTerminal, nullptr) &&
                 gst_element_link_many(rawQueue, appSink, nullptr);
         if (!fixedLinksOk) {
             const QString failure = QString("%1: failed to link fixed GStreamer elements").arg(sinkName);
@@ -706,10 +755,33 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
         }
 
         g_signal_connect(appSink, "new-sample", G_CALLBACK(&LinuxPreviewSession::onNewSample), this);
+        if (fpsDisplaySink) {
+            g_signal_connect(fpsDisplaySink,
+                             "fps-measurements",
+                             G_CALLBACK(&LinuxPreviewSession::onFpsMeasurement),
+                             this);
+        }
 
         m_pipeline = pipeline;
         m_appSink = appSink;
         m_videoSink = videoSink;
+        m_fpsDisplaySink = fpsDisplaySink;
+
+        if (!installCaptureFpsProbe(tee)) {
+            const QString failure = QString("%1: failed to install capture FPS probe").arg(sinkName);
+            startupFailures << failure;
+            emit logMessage(QStringLiteral("[GST][WARN] ") + failure);
+            releasePipeline();
+            continue;
+        }
+        if (!fpsDisplaySink && sinkName != QStringLiteral("fakesink") &&
+            !installRenderFpsProbe(convert)) {
+            const QString failure = QString("%1: failed to install render FPS fallback probe").arg(sinkName);
+            startupFailures << failure;
+            emit logMessage(QStringLiteral("[GST][WARN] ") + failure);
+            releasePipeline();
+            continue;
+        }
 
         emit logMessage(QString("[GST] Trying preview sink=%1").arg(sinkName));
         const GstStateChangeReturn stateRet = gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
@@ -729,6 +801,9 @@ bool LinuxPreviewSession::buildPipeline(const LinuxPreviewMode &mode,
         emit logMessage(QString("[GST] Selected preview sink=%1").arg(sinkName));
         if (sinkName == QStringLiteral("fakesink")) {
             emit logMessage(QStringLiteral("[GST][WARN] No real video sink reached PLAYING; using fakesink so raw appsink/live XDMA can still run. The embedded preview will be blank."));
+            emit renderFpsUpdated(-1.0);
+        } else if (!fpsDisplaySink) {
+            emit logMessage(QStringLiteral("[GST][WARN] Preview FPS is measured before the video sink because fpsdisplaysink is unavailable."));
         }
         emit logMessage(QString("[GST] Requested pipeline: v4l2src device=%1 ! video/x-raw,format=YUY2,width=%2,height=%3,framerate=%4/%5 ! tee")
                         .arg(mode.devicePath)
@@ -750,9 +825,13 @@ void LinuxPreviewSession::releasePipeline()
 {
     m_busTimer.stop();
     m_rawDeliveryEnabled.store(false);
+    removeFpsProbes();
 
     if (m_appSink) {
         g_signal_handlers_disconnect_by_data(m_appSink, this);
+    }
+    if (m_fpsDisplaySink) {
+        g_signal_handlers_disconnect_by_data(m_fpsDisplaySink, this);
     }
     if (m_pipeline) {
         gst_element_set_state(m_pipeline, GST_STATE_NULL);
@@ -762,6 +841,131 @@ void LinuxPreviewSession::releasePipeline()
     m_pipeline = nullptr;
     m_appSink = nullptr;
     m_videoSink = nullptr;
+    m_fpsDisplaySink = nullptr;
+}
+
+bool LinuxPreviewSession::installCaptureFpsProbe(GstElement *tee)
+{
+    GstPad *pad = gst_element_get_static_pad(tee, "sink");
+    if (!pad) {
+        return false;
+    }
+
+    const gulong probeId = gst_pad_add_probe(pad,
+                                             GST_PAD_PROBE_TYPE_BUFFER,
+                                             &LinuxPreviewSession::onCaptureFpsProbe,
+                                             this,
+                                             nullptr);
+    if (probeId == 0) {
+        gst_object_unref(pad);
+        return false;
+    }
+
+    m_captureFpsPad = pad;
+    m_captureFpsProbeId = probeId;
+    return true;
+}
+
+bool LinuxPreviewSession::installRenderFpsProbe(GstElement *convert)
+{
+    GstPad *pad = gst_element_get_static_pad(convert, "src");
+    if (!pad) {
+        return false;
+    }
+
+    const gulong probeId = gst_pad_add_probe(pad,
+                                             GST_PAD_PROBE_TYPE_BUFFER,
+                                             &LinuxPreviewSession::onRenderFpsProbe,
+                                             this,
+                                             nullptr);
+    if (probeId == 0) {
+        gst_object_unref(pad);
+        return false;
+    }
+
+    m_renderFpsPad = pad;
+    m_renderFpsProbeId = probeId;
+    return true;
+}
+
+void LinuxPreviewSession::removeFpsProbes()
+{
+    if (m_captureFpsPad) {
+        if (m_captureFpsProbeId != 0) {
+            gst_pad_remove_probe(m_captureFpsPad, m_captureFpsProbeId);
+        }
+        gst_object_unref(m_captureFpsPad);
+    }
+    if (m_renderFpsPad) {
+        if (m_renderFpsProbeId != 0) {
+            gst_pad_remove_probe(m_renderFpsPad, m_renderFpsProbeId);
+        }
+        gst_object_unref(m_renderFpsPad);
+    }
+
+    m_captureFpsPad = nullptr;
+    m_renderFpsPad = nullptr;
+    m_captureFpsProbeId = 0;
+    m_renderFpsProbeId = 0;
+}
+
+void LinuxPreviewSession::resetFpsCounters()
+{
+    QMutexLocker locker(&m_fpsMutex);
+    m_captureFpsTimer.invalidate();
+    m_renderFpsTimer.invalidate();
+    m_captureFpsFrames = 0;
+    m_renderFpsFrames = 0;
+}
+
+void LinuxPreviewSession::recordCaptureFrame()
+{
+    double fps = 0.0;
+    bool shouldEmit = false;
+    {
+        QMutexLocker locker(&m_fpsMutex);
+        if (!m_captureFpsTimer.isValid()) {
+            m_captureFpsTimer.start();
+        }
+        ++m_captureFpsFrames;
+        const qint64 elapsedMs = m_captureFpsTimer.elapsed();
+        if (elapsedMs >= kFpsUpdateIntervalMs) {
+            fps = static_cast<double>(m_captureFpsFrames) * 1000.0
+                    / static_cast<double>(elapsedMs);
+            m_captureFpsFrames = 0;
+            m_captureFpsTimer.restart();
+            shouldEmit = true;
+        }
+    }
+
+    if (shouldEmit) {
+        emit captureFpsUpdated(fps);
+    }
+}
+
+void LinuxPreviewSession::recordRenderFrame()
+{
+    double fps = 0.0;
+    bool shouldEmit = false;
+    {
+        QMutexLocker locker(&m_fpsMutex);
+        if (!m_renderFpsTimer.isValid()) {
+            m_renderFpsTimer.start();
+        }
+        ++m_renderFpsFrames;
+        const qint64 elapsedMs = m_renderFpsTimer.elapsed();
+        if (elapsedMs >= kFpsUpdateIntervalMs) {
+            fps = static_cast<double>(m_renderFpsFrames) * 1000.0
+                    / static_cast<double>(elapsedMs);
+            m_renderFpsFrames = 0;
+            m_renderFpsTimer.restart();
+            shouldEmit = true;
+        }
+    }
+
+    if (shouldEmit) {
+        emit renderFpsUpdated(fps);
+    }
 }
 
 void LinuxPreviewSession::pollBus()
@@ -805,6 +1009,50 @@ void LinuxPreviewSession::pollBus()
 
     if (shouldStop) {
         stop();
+    }
+}
+
+GstPadProbeReturn LinuxPreviewSession::onCaptureFpsProbe(GstPad *pad,
+                                                         GstPadProbeInfo *info,
+                                                         gpointer userData)
+{
+    Q_UNUSED(pad);
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        auto *session = static_cast<LinuxPreviewSession *>(userData);
+        if (session) {
+            session->recordCaptureFrame();
+        }
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+GstPadProbeReturn LinuxPreviewSession::onRenderFpsProbe(GstPad *pad,
+                                                        GstPadProbeInfo *info,
+                                                        gpointer userData)
+{
+    Q_UNUSED(pad);
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        auto *session = static_cast<LinuxPreviewSession *>(userData);
+        if (session) {
+            session->recordRenderFrame();
+        }
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+void LinuxPreviewSession::onFpsMeasurement(GstElement *sink,
+                                           gdouble fps,
+                                           gdouble droprate,
+                                           gdouble avgfps,
+                                           gpointer userData)
+{
+    Q_UNUSED(sink);
+    Q_UNUSED(droprate);
+    Q_UNUSED(avgfps);
+
+    auto *session = static_cast<LinuxPreviewSession *>(userData);
+    if (session) {
+        emit session->renderFpsUpdated(static_cast<double>(fps));
     }
 }
 

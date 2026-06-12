@@ -1,3 +1,6 @@
+// Copyright (c) 2026 jingzezhang818.
+// All rights reserved.
+
 #ifndef XDMA_DLL_PUBLIC_LINUX_H
 #define XDMA_DLL_PUBLIC_LINUX_H
 
