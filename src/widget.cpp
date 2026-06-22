@@ -1210,6 +1210,7 @@ void Widget::onRawPreviewFrameAvailable(const CapturedFrame &frame)
         return;
     }
 
+    m_lastLiveSendMs = nowMs;
     const bool ok = sendVideoPayloadWithBatching(payload,
                                                  QString("live raw YUYV %1x%2")
                                                  .arg(expectedResolution.width())
